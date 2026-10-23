@@ -382,6 +382,9 @@ module.exports = {
   cleanupFile,
   pickAudioFormat,
   DEFAULT_CLIENT_ORDER,
+  // Reused by utils/youtube/audioApis.js and any other provider that hands us
+  // a plain media URL: ranged, size-capped download straight to a file.
+  downloadUrlToFile: downloadStreamUrl,
   _downloadStreamUrl: downloadStreamUrl,
   // Internals used by the offline test suite (see test/play.test.js).
   _setYoutubeModule: (mod) => {

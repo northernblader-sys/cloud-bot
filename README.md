@@ -48,14 +48,22 @@ pm2 save
 | `.fb <url>` | Download a Facebook video/photo |
 | `.dl <url>` | Auto-detect the platform and download |
 
-`.play` searches YouTube (youtubei.js), then downloads the audio-only stream
-straight from YouTube's InnerTube API (`utils/youtube/innertube.js`). Several
-InnerTube clients are tried in order — TV first, since it still serves audio
-without a PO token — and the first one that returns real bytes wins; the
-download is streamed in byte ranges to a temp file, converted to MP3 with
-ffmpeg, and sent back as a WhatsApp audio message (with the cover art as a
-thumbnail). If every YouTube client refuses, it falls back to the y2mate
-scraper in `utils/y2mate/audio.js`.
+`.play` fetches audio from three sources, in order, and only accepts a source
+that actually produced audio bytes:
+
+1. **YouTube InnerTube** (`utils/youtube/innertube.js`) — several clients are
+   tried (TV first, since it still serves audio without a PO token) and the
+   first that returns real bytes wins. Highest quality, one request.
+2. **Public YouTube APIs** (`utils/youtube/audioApis.js`) — Piped, Invidious,
+   cobalt, or your own endpoint, so a blocked server IP still gets audio from
+   someone else's. Every response is magic-number checked, so an HTML "rate
+   limited" page is never sent as a voice note.
+3. **y2mate** (`utils/y2mate/audio.js`) — HTML scraper, last resort.
+
+The winning source is streamed in verified byte ranges to a temp file,
+converted to MP3 with ffmpeg, and sent as a WhatsApp audio message (with the
+cover art as a thumbnail). If all three refuse, the reply names the first
+error from each stage instead of a generic message.
 
 Notes:
 
@@ -67,6 +75,14 @@ Notes:
   bot"). Optional env vars help there: `YT_PO_TOKEN` (Proof-of-Origin token),
   `YT_VISITOR_DATA`, `YT_COOKIE`, and `YT_CLIENTS` (comma-separated client
   order override, e.g. `TVHTML5,iOS,WEB`).
+- Tune the fallback APIs with:
+  - `YT_AUDIO_APIS` — order/list of providers, e.g. `piped,cobalt`, or a bare
+    template URL `https://api.example/dl?id={id}` whose JSON/text response
+    contains the media link.
+  - `PIPED_INSTANCES`, `INVIDIOUS_INSTANCES`, `COBALT_INSTANCES`
+    (or `COBALT_API_URL`) — comma-separated base URLs to use instead of the
+    built-in public ones. Self-hosted instances are the most reliable fix if
+    public ones are slow or down.
 
 `.tiktok`/`.ig`/`.pinterest`/`.fb` use tikwm.com and api-faa.my.id. Those are
 third-party scraper APIs, not official platform APIs — they can change or go

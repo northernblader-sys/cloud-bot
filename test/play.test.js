@@ -20,8 +20,10 @@ const { mkdtemp } = require("node:fs/promises");
 const ROOT = path.join(__dirname, "..");
 const inner = require(path.join(ROOT, "utils", "youtube", "innertube.js"));
 const { pickAudioOption } = require(path.join(ROOT, "utils", "y2mate", "audio.js"));
+const realIsLikelyAudio = require(path.join(ROOT, "utils", "youtube", "audioApis.js")).isLikelyAudio;
 
-const PAYLOAD = Buffer.alloc(3 * 1024 * 1024 + 77, 5);
+// A fake-but-plausible MP3: real magic bytes, so the audio sniffers accept it.
+const PAYLOAD = Buffer.concat([Buffer.from("ID3"), Buffer.alloc(3 * 1024 * 1024 + 74, 5)]);
 
 function startMediaServer() {
   const requests = [];
@@ -190,7 +192,7 @@ test("innertube: reports blocked / audio-less videos instead of pretending", asy
   }
 });
 
-function withPlayDependencies({ innertube, y2mate }) {
+function withPlayDependencies({ innertube, y2mate, audioApis }) {
   const playPath = path.join(ROOT, "commands", "downloaders", "play.js");
   const originalLoad = Module._load;
 
@@ -208,6 +210,14 @@ function withPlayDependencies({ innertube, y2mate }) {
         };
       }
       if (request === "../../utils/youtube/innertube") return innertube;
+      if (request === "../../utils/youtube/audioApis") {
+        return audioApis || {
+          isLikelyAudio: realIsLikelyAudio,
+          fetchAudioFromApis: async () => {
+            throw new Error("public APIs unavailable in this test");
+          },
+        };
+      }
       if (request === "../../utils/y2mate/audio") return { downloadY2mateAudioToFile: y2mate };
     }
     return originalLoad.apply(this, arguments);
@@ -251,7 +261,38 @@ test("play: sends the InnerTube download back as an audio message", async () => 
   assert.match(sock.sent[1].text, /Found \*Test Song\*/);
 });
 
-test("play: falls back to y2mate when YouTube refuses every client", async () => {
+test("play: uses a public API when YouTube refuses every client", async () => {
+  let apiCalls = 0;
+  let y2mateCalls = 0;
+  const playSong = withPlayDependencies({
+    innertube: {
+      ...idleCleanup,
+      fetchAudioToFile: async () => {
+        throw new Error("LOGIN_REQUIRED");
+      },
+    },
+    audioApis: {
+      isLikelyAudio: realIsLikelyAudio,
+      fetchAudioFromApis: async (id, file) => {
+        apiCalls += 1;
+        writeFileSync(file, Buffer.concat([Buffer.from("ID3"), Buffer.alloc(3072, 1)]));
+        return { source: "piped:example", mimeType: "audio/mpeg", title: "Test Song", durationSec: 0 };
+      },
+    },
+    y2mate: async () => {
+      y2mateCalls += 1;
+      throw new Error("should not be reached");
+    },
+  });
+
+  const result = await playSong(fakeSock(), { key: { remoteJid: "1@g.us" } }, "test song");
+
+  assert.equal(apiCalls, 1);
+  assert.equal(y2mateCalls, 0, "y2mate is only a last resort");
+  assert.ok(Buffer.isBuffer(result.audio));
+});
+
+test("play: falls back to y2mate when YouTube and the APIs refuse", async () => {
   let y2mateCalls = 0;
   const playSong = withPlayDependencies({
     innertube: {
@@ -283,6 +324,12 @@ test("play: explains the failure when both sources are blocked", async () => {
         throw new Error("LOGIN_REQUIRED: Sign in to confirm you're not a bot");
       },
     },
+    audioApis: {
+      isLikelyAudio: realIsLikelyAudio,
+      fetchAudioFromApis: async () => {
+        throw new Error("no public audio API had this track");
+      },
+    },
     y2mate: async () => {
       throw new Error("y2mate exposed no audio option");
     },
@@ -293,6 +340,7 @@ test("play: explains the failure when both sources are blocked", async () => {
   assert.equal(result.audio, undefined);
   assert.match(result.text, /anti-bot/);
   assert.match(result.text, /Details: LOGIN_REQUIRED/);
+  assert.doesNotMatch(result.text, /^\s*⚠️\s*No audio format/);
 });
 
 test("play: oversized tracks are sent as a document instead of failing", async () => {
@@ -315,4 +363,206 @@ test("play: oversized tracks are sent as a document instead of failing", async (
   assert.equal(result.audio, undefined);
   assert.equal(result.mimetype, "audio/mpeg");
   assert.equal(result.fileName, "Long Mix.mp3");
+});
+
+// ── public API layer (utils/youtube/audioApis.js) ──────────────────
+
+function startApiServer(routes) {
+  const server = http.createServer((req, res) => {
+    const route = routes[req.url.split("?")[0]];
+    if (!route) {
+      res.writeHead(404, { "content-type": "text/plain" });
+      return res.end("not found");
+    }
+    return route(req, res);
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () =>
+      resolve({ server, origin: `http://127.0.0.1:${server.address().port}` })
+    );
+  });
+}
+
+function mediaRoute(req, res) {
+  const match = /bytes=(\d+)-(\d+)/.exec(req.headers.range || "");
+  if (!match) {
+    res.writeHead(200, { "content-length": PAYLOAD.length });
+    return res.end(PAYLOAD);
+  }
+  const start = Number(match[1]);
+  const end = Math.min(Number(match[2]), PAYLOAD.length - 1);
+  const slice = PAYLOAD.subarray(start, end + 1);
+  res.writeHead(206, {
+    "content-range": `bytes ${start}-${end}/${PAYLOAD.length}`,
+    "content-length": slice.length,
+  });
+  res.end(slice);
+}
+
+function jsonRoute(payload) {
+  return (req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(payload));
+  };
+}
+
+function clearApiEnv() {
+  for (const key of ["YT_AUDIO_APIS", "PIPED_INSTANCES", "INVIDIOUS_INSTANCES", "COBALT_API_URL", "COBALT_INSTANCES"]) {
+    delete process.env[key];
+  }
+}
+
+test("apis: resolves audio from a Piped instance and downloads it", async () => {
+  const { server, origin } = await startApiServer({
+    "/streams/video-id": jsonRoute({
+      title: "Piped Song",
+      uploader: "Piped Artist",
+      duration: 187,
+      audioStreams: [
+        { url: "/media?itag=139", mimeType: "audio/mp4", bitrate: 48000 },
+        { url: "/media?itag=140", mimeType: "audio/mp4", bitrate: 129000 },
+      ],
+    }),
+    "/media": mediaRoute,
+  });
+  const dir = await mkdtemp(path.join(os.tmpdir(), "play-api-"));
+  const file = path.join(dir, "track.source");
+
+  try {
+    clearApiEnv();
+    process.env.PIPED_INSTANCES = origin;
+    process.env.YT_AUDIO_APIS = "piped";
+
+    const { fetchAudioFromApis } = require(path.join(ROOT, "utils", "youtube", "audioApis.js"));
+    const result = await fetchAudioFromApis("video-id", file);
+
+    assert.equal(result.bytes, PAYLOAD.length);
+    assert.equal(result.title, "Piped Song");
+    assert.equal(result.author, "Piped Artist");
+    assert.equal(result.durationSec, 187);
+    assert.match(result.source, /^piped:/);
+    assert.ok(readFileSync(file).equals(PAYLOAD));
+  } finally {
+    clearApiEnv();
+    server.close();
+  }
+});
+
+test("apis: resolves audio from an Invidious instance (relative URLs too)", async () => {
+  const { server, origin } = await startApiServer({
+    "/api/v1/videos/video-id": jsonRoute({
+      title: "Invidious Song",
+      author: "Invidious Artist",
+      lengthSeconds: 200,
+      adaptiveFormats: [
+        { url: "/media?itag=251", type: 'audio/webm; codecs="opus"', bitrate: "160000" },
+        { url: "/media?itag=140", type: 'audio/mp4; codecs="mp4a.40.2"', bitrate: "129000" },
+      ],
+    }),
+    "/media": mediaRoute,
+  });
+  const dir = await mkdtemp(path.join(os.tmpdir(), "play-api-"));
+  const file = path.join(dir, "track.source");
+
+  try {
+    clearApiEnv();
+    process.env.INVIDIOUS_INSTANCES = origin;
+    process.env.YT_AUDIO_APIS = "invidious";
+
+    const { fetchAudioFromApis } = require(path.join(ROOT, "utils", "youtube", "audioApis.js"));
+    const result = await fetchAudioFromApis("video-id", file);
+
+    assert.equal(result.bytes, PAYLOAD.length);
+    assert.equal(result.title, "Invidious Song");
+    assert.match(result.source, /^invidious:/);
+  } finally {
+    clearApiEnv();
+    server.close();
+  }
+});
+
+test("apis: supports a cobalt instance (POST -> tunnel URL)", async () => {
+  const { server, origin } = await startApiServer({
+    "/": (req, res) => {
+      let body = "";
+      req.on("data", (chunk) => (body += chunk));
+      req.on("end", () => {
+        const parsed = JSON.parse(body || "{}");
+        const ok = parsed.downloadMode === "audio" && /youtube\.com\/watch\?v=video-id/.test(parsed.url);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify(
+            ok ? { status: "tunnel", url: `${origin}/media`, filename: "song.mp3" } : { status: "error" }
+          )
+        );
+      });
+    },
+    "/media": mediaRoute,
+  });
+  const dir = await mkdtemp(path.join(os.tmpdir(), "play-api-"));
+  const file = path.join(dir, "track.source");
+
+  try {
+    clearApiEnv();
+    process.env.COBALT_INSTANCES = origin;
+    process.env.YT_AUDIO_APIS = "cobalt";
+
+    const { fetchAudioFromApis } = require(path.join(ROOT, "utils", "youtube", "audioApis.js"));
+    const result = await fetchAudioFromApis("video-id", file);
+
+    assert.equal(result.bytes, PAYLOAD.length);
+    assert.match(result.source, /^cobalt:/);
+  } finally {
+    clearApiEnv();
+    server.close();
+  }
+});
+
+test("apis: accepts a custom {id} endpoint and rejects non-audio responses", async () => {
+  const routes = {
+    "/html": (req, res) => {
+      res.writeHead(200, { "content-type": "text/html" });
+      res.end("<html><body>rate limited</body></html>");
+    },
+    "/media": mediaRoute,
+  };
+  const { server, origin } = await startApiServer(routes);
+  // Absolute media URL, like a real "custom API" would return.
+  routes["/good"] = jsonRoute({ data: { downloadUrl: `${origin}/media` } });
+  const dir = await mkdtemp(path.join(os.tmpdir(), "play-api-"));
+  const file = path.join(dir, "track.source");
+  const { fetchAudioFromApis } = require(path.join(ROOT, "utils", "youtube", "audioApis.js"));
+
+  try {
+    clearApiEnv();
+    process.env.YT_AUDIO_APIS = `${origin}/good?id={id}`;
+    let result = await fetchAudioFromApis("video-id", file);
+    assert.equal(result.bytes, PAYLOAD.length);
+    assert.equal(result.source, "custom-api");
+
+    // An HTML "200 OK" must not be mistaken for audio.
+    clearApiEnv();
+    process.env.YT_AUDIO_APIS = `${origin}/html?id={id}`;
+    await assert.rejects(fetchAudioFromApis("video-id", file), (err) => {
+      assert.match(err.failures[0].error, /not audio|no media URL/i);
+      return true;
+    });
+  } finally {
+    clearApiEnv();
+    server.close();
+  }
+});
+
+test("apis: magic-number checks recognise real audio containers", () => {
+  const { isLikelyAudio } = require(path.join(ROOT, "utils", "youtube", "audioApis.js"));
+
+  assert.equal(
+    isLikelyAudio(Buffer.concat([Buffer.from("ID3\u0004\u0000\u0000", "latin1"), Buffer.alloc(12)])),
+    true
+  );
+  assert.equal(isLikelyAudio(Buffer.concat([Buffer.from([0xff, 0xfb, 0x90, 0x00]), Buffer.alloc(12)])), true);
+  assert.equal(isLikelyAudio(Buffer.concat([Buffer.from([0, 0, 0, 0x20]), Buffer.from("ftypM4A "), Buffer.alloc(8)])), true);
+  assert.equal(isLikelyAudio(Buffer.from("<html>blocked</html>")), false);
+  assert.equal(isLikelyAudio(Buffer.from('{"error":"nope"}')), false);
+  assert.equal(isLikelyAudio(Buffer.alloc(0)), false);
 });
