@@ -51,7 +51,8 @@ http
   .listen(PORT, "0.0.0.0", () => console.log(`HTTP endpoint listening on :${PORT} (/ and /health)`));
 
 // Hardcoded bot number for pairing (digits only, country code + number, no + or spaces).
-const BOT_NUMBER = "2347017869953";
+// Can be overridden with a BOT_NUMBER env var in Render; otherwise uses the default below.
+const BOT_NUMBER = (process.env.BOT_NUMBER || "2347073323366").replace(/\D/g, "");
 
 let currentSock = null; // only the newest socket is allowed to request pairing codes
 
