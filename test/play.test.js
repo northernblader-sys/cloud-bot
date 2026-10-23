@@ -352,7 +352,7 @@ test("play: explains the failure when both sources are blocked", async () => {
   assert.match(result.text, /• YouTube: LOGIN_REQUIRED/);
   assert.match(result.text, /• public APIs:/);
   assert.match(result.text, /• y2mate:/);
-  assert.match(result.text, /YT_COOKIE|YT_PO_TOKEN/, "should point at the fix");
+  assert.match(result.text, /\.play cookie/, "should point at the fix");
   assert.doesNotMatch(result.text, /Details:\s*$/m);
   assert.doesNotMatch(result.text, /No audio format/);
 });
@@ -667,6 +667,107 @@ exit 0
   ytdlp._reset();
 });
 
+test("ytdlp: a bot-blocked client is not the end of the run", async () => {
+  // The real-world case: the first client group gets "Sign in to confirm
+  // you're not a bot", a later one is let through. Before the ladder existed
+  // the whole source gave up on the first refusal.
+  const ytdlp = require(path.join(ROOT, "utils", "youtube", "ytdlp.js"));
+  const log = path.join(await mkdtemp(path.join(os.tmpdir(), "ytdlp-calls-")), "calls.log");
+
+  const bin = await writeFakeYtdlp(`
+echo "$@" >> "${log}"
+case "$@" in
+  *player_client=default,web_safari*)
+    echo "ERROR: [youtube] video-id: Sign in to confirm you're not a bot. Use --cookies" >&2
+    exit 1
+    ;;
+esac
+${GOOD_YTDLP}
+`);
+
+  process.env.YTDLP_PATH = bin;
+  ytdlp._reset();
+
+  try {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "ytdlp-out-"));
+    const target = path.join(dir, "a.bin");
+    const result = await ytdlp.fetchAudioWithYtdlp("video-id", target);
+
+    assert.equal(result.source, "yt-dlp");
+    assert.match(result.title, /yt-dlp Song/);
+
+    const calls = readFileSync(log, "utf8").trim().split("\n").filter(Boolean);
+    assert.ok(calls.length >= 2, `expected a second client to be tried, got ${calls.length}`);
+    // The second attempt has to be a *different* client, not a repeat.
+    assert.doesNotMatch(calls[1], /player_client=default,web_safari/);
+  } finally {
+    delete process.env.YTDLP_PATH;
+    ytdlp._reset();
+  }
+});
+
+test("ytdlp: cookies are handed to yt-dlp, and a known block is not retried", async () => {
+  const ytdlp = require(path.join(ROOT, "utils", "youtube", "ytdlp.js"));
+  const session = require(path.join(ROOT, "utils", "youtube", "session.js"));
+  const log = path.join(await mkdtemp(path.join(os.tmpdir(), "ytdlp-cookie-")), "calls.log");
+
+  const savedEnv = {};
+  for (const name of ["YT_COOKIES_B64", "YT_COOKIES", "YT_COOKIE", "YT_COOKIES_FILE"]) {
+    savedEnv[name] = process.env[name];
+    delete process.env[name];
+  }
+  session.clearCookies();
+  session._reset();
+  session.setCookies("SID=sid-value; HSID=hsid-value; VISITOR_INFO1_LIVE=visitor");
+
+  const bin = await writeFakeYtdlp(`
+echo "$@" >> "${log}"
+echo "ERROR: [youtube] video-id: Sign in to confirm you're not a bot. Use --cookies" >&2
+exit 1
+`);
+  process.env.YTDLP_PATH = bin;
+  ytdlp._reset();
+
+  try {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "ytdlp-out-"));
+
+    await assert.rejects(
+      ytdlp.fetchAudioWithYtdlp("video-id", path.join(dir, "a.bin"), { strategy: "arroxy" })
+    );
+    const first = readFileSync(log, "utf8").trim().split("\n").filter(Boolean);
+    assert.ok(first.length >= 2);
+    // Every attempt carries the cookie file...
+    for (const call of first) assert.match(call, /--cookies \S+yt-cookies\.txt/);
+    // ...and the block message survives to the user.
+    assert.match(
+      await ytdlp
+        .fetchAudioWithYtdlp("video-id", path.join(dir, "b.bin"), { strategy: "arroxy" })
+        .then(() => "")
+        .catch((err) => err.message),
+      /Sign in to confirm/i
+    );
+
+    // Second run in the same window: every client is a known block, so it must
+    // not hit YouTube again — but it still reports the real reason.
+    const before = readFileSync(log, "utf8").trim().split("\n").filter(Boolean).length;
+    const err = await ytdlp
+      .fetchAudioWithYtdlp("video-id", path.join(dir, "c.bin"), { strategy: "arroxy" })
+      .then(() => null)
+      .catch((e) => e);
+    const after = readFileSync(log, "utf8").trim().split("\n").filter(Boolean).length;
+    assert.equal(after, before, "a known block must not be retried immediately");
+    assert.match(err.message, /Sign in to confirm/i);
+  } finally {
+    session.clearCookies();
+    delete process.env.YTDLP_PATH;
+    ytdlp._reset();
+    for (const [name, value] of Object.entries(savedEnv)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+});
+
 test("play: prefers yt-dlp, then InnerTube, then APIs, then y2mate", async () => {
   const calls = [];
   const write = (file, byte) => writeFileSync(file, Buffer.concat([Buffer.from("ID3"), Buffer.alloc(2048, byte)]));
@@ -710,14 +811,31 @@ test("play: prefers yt-dlp, then InnerTube, then APIs, then y2mate", async () =>
 
 // ── Arroxy ladder (second yt-dlp pass) ─────────────────────────────
 
-test("arroxy: ladder order is po-token -> non-PoT clients -> yt-dlp defaults", () => {
+test("arroxy: the ladder walks clients instead of repeating one request", () => {
   const ytdlp = require(path.join(ROOT, "utils", "youtube", "ytdlp.js"));
 
+  // No cookies: a PO token attempt (none here), then one attempt per client
+  // group, ending with yt-dlp's own defaults. Repeating the same client after
+  // "Sign in to confirm you're not a bot" can never succeed.
   const without = ytdlp.arroxyLadder({ url: "u", template: "t", poToken: null, visitorData: null });
-  assert.deepEqual(without.map((entry) => entry.label), ["no-pot-clients", "no-extractor-args"]);
-  // VidBee's trick: the clients that *demand* a PO token are removed.
-  const fallbackArgs = without[0].args.join(" ");
-  assert.match(fallbackArgs, /player_client=default,-web,-web_safari/);
+  assert.deepEqual(without.map((entry) => entry.label), [
+    "tv_simply,tv",
+    "android_vr",
+    "ios",
+    "mweb,web_safari",
+    "default,-web,-web_safari",
+    "no-extractor-args",
+  ]);
+
+  const args = without.map((entry) => entry.args.join(" "));
+  // VidBee's trick survives as one rung of the ladder.
+  assert.ok(args.some((entry) => /player_client=default,-web,-web_safari/.test(entry)));
+  // Every rung before the last passes exactly one --extractor-args block.
+  for (const entry of args.slice(0, -1)) {
+    assert.equal((entry.match(/--extractor-args/g) || []).length, 1);
+  }
+  // No cookies means no --cookies flag.
+  assert.ok(args.every((entry) => !entry.includes("--cookies")));
 
   const withToken = ytdlp.arroxyLadder({
     url: "u",
@@ -725,7 +843,7 @@ test("arroxy: ladder order is po-token -> non-PoT clients -> yt-dlp defaults", (
     poToken: "TOKEN123",
     visitorData: "VD456",
   });
-  assert.deepEqual(withToken.map((entry) => entry.label), ["po-token", "no-pot-clients", "no-extractor-args"]);
+  assert.equal(withToken[0].label, "po-token");
 
   const potArgs = withToken[0].args.join(" ");
   // One --extractor-args block per extractor, carrying token + visitor data.
@@ -735,13 +853,34 @@ test("arroxy: ladder order is po-token -> non-PoT clients -> yt-dlp defaults", (
 
   // A token without visitor data is useless to yt-dlp, so no PoT attempt.
   const tokenOnly = ytdlp.arroxyLadder({ url: "u", template: "t", poToken: "TOKEN123", visitorData: null });
-  assert.deepEqual(tokenOnly.map((entry) => entry.label), ["no-pot-clients", "no-extractor-args"]);
+  assert.equal(tokenOnly[0].label, "tv_simply,tv");
+
+  // With cookies the session is what YouTube wants, so web clients lead and
+  // every rung carries --cookies. A PO token is never combined with cookies.
+  const withCookies = ytdlp.arroxyLadder({
+    url: "u",
+    template: "t",
+    poToken: "TOKEN123",
+    visitorData: "VD456",
+    cookiePath: "/tmp/cookies.txt",
+  });
+  assert.deepEqual(withCookies.map((entry) => entry.label), [
+    "yt-dlp defaults",
+    "web_safari,web,mweb",
+    "tv_simply,tv",
+  ]);
+  for (const entry of withCookies) {
+    const joined = entry.args.join(" ");
+    assert.match(joined, /--cookies \/tmp\/cookies\.txt/);
+    assert.doesNotMatch(joined, /po_token=/);
+  }
 
   // Hardening flags from Arroxy's download path.
+  const hardened = without[0].args.join(" ");
   for (const flag of ["--ignore-config", "--http-chunk-size", "--abort-on-unavailable-fragments", "--no-js-runtimes"]) {
-    assert.ok(fallbackArgs.includes(flag), `expected ${flag}`);
+    assert.ok(hardened.includes(flag), `expected ${flag}`);
   }
-  assert.ok(fallbackArgs.includes(`node:${process.execPath}`), "passes the bot's own node runtime");
+  assert.ok(hardened.includes(`node:${process.execPath}`), "passes the bot's own node runtime");
 });
 
 test("arroxy: classifies yt-dlp failures into actionable kinds", () => {

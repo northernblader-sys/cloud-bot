@@ -147,6 +147,59 @@ fetch function in `utils/downloaders/fetchers.js`.
 
 Replying to a message that contains a supported link also works for `.dl`.
 
+## When `.play` says "every source refused"
+
+On a datacenter host (Render, Railway, Fly, any VPS) YouTube answers
+**"Sign in to confirm you're not a bot"** for every client — yt-dlp, InnerTube,
+public frontends alike. It is not a bug in the bot: YouTube wants an
+account-backed session from IPs it doesn't trust. The bot now knows this and
+tells you so.
+
+**The fix is one message.** In a browser, sign in to YouTube, export cookies
+with the "Get cookies.txt LOCALLY" extension, then:
+
+```sh
+base64 -w0 cookies.txt        # macOS: base64 -i cookies.txt
+```
+
+DM the bot (owner only, never in a group):
+
+```
+.play cookie <paste that text>
+```
+
+It is validated (a visitor-only export with no `SID`/`HSID` is rejected with an
+explanation), stored through `utils/persist.js` — so in MongoDB when
+`MONGODB_URI` is set, surviving redeploys — and written to a `cookies.txt` that
+yt-dlp is given via `--cookies` and InnerTube via its session. Cookie values are
+never echoed back or logged.
+
+- `.play cookie` — state: how many cookies, signed-in or visitor export, source, age
+- `.play cookie clear` — remove them
+
+Hosts can set the same thing without chat instead:
+`YT_COOKIES_B64` (base64), `YT_COOKIES` (the file contents), `YT_COOKIE` (a
+`SID=…; HSID=…` header), or `YT_COOKIES_FILE` (a path).
+
+Cookies expire after a few months; when `.play` starts blocking again,
+re-export and resend.
+
+### What else changed for this
+
+- **Client ladder.** A bot block is per-client as well as per-IP, so yt-dlp now
+  walks `tv_simply,tv` → `android_vr` → `ios` → `mweb,web_safari` →
+  `default,-web,-web_safari` → its own defaults (or, with cookies,
+  defaults → `web_safari,web,mweb` → `tv_simply,tv`) instead of repeating one
+  refused request. With cookies, no PO-token attempt is made — yt-dlp refuses
+  that combination.
+- **No repeated pain.** A client group refused in the last 10 minutes is
+  skipped for subsequent attempts, so the second yt-dlp pass doesn't re-hammer
+  YouTube, and the user still sees the original reason.
+- **InnerTube** asks the web clients first when cookies exist (they're the ones
+  that use a session), and a null player response now reports "YouTube's player
+  data was incomplete (this client is being throttled)" instead of the
+  meaningless `Cannot read properties of null (reading 'as')`.
+
 ## Welcome verification
 
 When `.welcome` is on and someone joins, the bot asks **one anime question**
