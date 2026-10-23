@@ -42,28 +42,36 @@ pm2 save
 | Command | Description |
 |---|---|
 | `.play <song name or link>` | Search YouTube and send back the audio as MP3 |
-
-`.play` searches YouTube for the song, then downloads the audio through a
-y2mate-based scraping backend. This depends on a third-party site's HTML
-structure, so it can break if they change their site — if `.play` stops
-working, the fix is updating the scraping logic in `utils/y2mate/audio.js`.
-
-## Downloaders
-
-| Command | Description |
-|---|---|
-| `.play <song name or link>` | Search YouTube and send back the audio as MP3 |
 | `.tiktok <url>` | Download a TikTok video (or images) |
 | `.ig <url>` | Download an Instagram post/reel |
 | `.pinterest <url>` | Download a Pinterest image/video/gif |
 | `.fb <url>` | Download a Facebook video/photo |
 | `.dl <url>` | Auto-detect the platform and download |
 
-`.play` uses a y2mate-based scraping backend. `.tiktok`/`.ig`/`.pinterest`/`.fb`
-use tikwm.com and api-faa.my.id. All of these are third-party scraper APIs,
-not official platform APIs — they can change or go down without notice. If
-one stops working, the fix is updating the relevant fetch function in
-`utils/downloaders/fetchers.js` (or `utils/y2mate/` for `.play`).
+`.play` searches YouTube (youtubei.js), then downloads the audio-only stream
+straight from YouTube's InnerTube API (`utils/youtube/innertube.js`). Several
+InnerTube clients are tried in order — TV first, since it still serves audio
+without a PO token — and the first one that returns real bytes wins; the
+download is streamed in byte ranges to a temp file, converted to MP3 with
+ffmpeg, and sent back as a WhatsApp audio message (with the cover art as a
+thumbnail). If every YouTube client refuses, it falls back to the y2mate
+scraper in `utils/y2mate/audio.js`.
+
+Notes:
+
+- Long tracks are re-encoded at a lower bitrate so the MP3 stays under
+  WhatsApp's ~16 MB media limit; anything still too large is sent as a
+  playable document instead of failing.
+- If ffmpeg isn't available the original m4a/webm audio is sent instead.
+- YouTube sometimes blocks datacenter IPs ("Sign in to confirm you're not a
+  bot"). Optional env vars help there: `YT_PO_TOKEN` (Proof-of-Origin token),
+  `YT_VISITOR_DATA`, `YT_COOKIE`, and `YT_CLIENTS` (comma-separated client
+  order override, e.g. `TVHTML5,iOS,WEB`).
+
+`.tiktok`/`.ig`/`.pinterest`/`.fb` use tikwm.com and api-faa.my.id. Those are
+third-party scraper APIs, not official platform APIs — they can change or go
+down without notice. If one stops working, the fix is updating the relevant
+fetch function in `utils/downloaders/fetchers.js`.
 
 Replying to a message that contains a supported link also works for `.dl`.
 
