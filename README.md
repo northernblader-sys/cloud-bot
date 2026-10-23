@@ -37,6 +37,33 @@ pm2 save
 | `.tenor <query>[, count]` | Search Tenor and send back animated stickers |
 | `.about` | About Astral Cloud |
 
+## The `.cloud` brain
+
+`.cloud <anything>` routes a natural-language message to one of the bot's
+commands, or answers it conversationally.
+
+- **Model:** OpenRouter (`utils/openrouter.js`), `openai/gpt-4o-mini` by
+  default — cheap, fast, handles tool calling and images. Set
+  `OPENROUTER_MODEL` to switch (e.g. `openai/gpt-4o`). The key is read from
+  `OPENROUTER_API_KEY`, or from `<DATA_DIR>/openrouter.key` (one line,
+  gitignored) — see `utils/openrouter.key.example`. It is deliberately not
+  committed: GitHub's push protection rejects live credentials in a public
+  repo, and anyone who could read the file could spend against it.
+- **Personality:** `utils/cloudPersonality.js` — identity, tone rules, voice
+  examples and reply clean-up (no em dashes, no markdown). Edit this file to
+  change how cloud talks; nothing else needs touching.
+- **Memory:** `utils/cloudMemory.js` — remembers each member by phone number
+  and name, plus a running transcript **per person per chat**, so two people in
+  the same group never share a conversation. Names/facts are learned from the
+  model's `<remember .../>` tags (stripped before sending) with a regex backup
+  for "my name is …" / "call me …". Stored through `utils/persist.js`, so it
+  survives restarts (MongoDB when `MONGODB_URI` is set, JSON files otherwise).
+- **Grounding:** answers use OpenRouter's web plugin for live info.
+- **Housekeeping:** `.cloud whoami` shows what the bot remembers about you,
+  `.cloud forget me` wipes your name, facts and transcripts.
+- If OpenRouter is unreachable **and** `GEMINI_API_KEY` is set, it falls back
+  to the old Gemini path so `.cloud` still answers.
+
 ## Downloaders
 
 | Command | Description |

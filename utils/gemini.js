@@ -297,4 +297,10 @@ async function answerWithSearch(userText, { imageBase64, imageMime } = {}) {
   return text || "couldnt find anything on that, try asking differently";
 }
 
-module.exports = { routeMessage, answerWithSearch };
+module.exports = {
+  routeMessage,
+  answerWithSearch,
+  // The tool table is shared with the OpenRouter brain (utils/cloudBrain.js),
+  // which translates these declarations to OpenAI's tool format.
+  ROUTER_TOOLS,
+};

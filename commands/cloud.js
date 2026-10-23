@@ -1,5 +1,6 @@
 const { downloadMediaMessage } = require("@whiskeysockets/baileys");
-const { routeMessage, answerWithSearch } = require("../utils/gemini");
+const gemini = require("../utils/gemini");
+const brain = require("../utils/cloudBrain");
 const { getQuotedMedia } = require("../utils/quotedMessage");
 const { playSong } = require("./downloaders/play");
 const { downloadAuto } = require("./downloaders/media");
@@ -17,6 +18,7 @@ const { generateQr } = require("./qr");
 const { calculate } = require("./calc");
 const { shortenUrl } = require("./shorten");
 const { tenorSticker } = require("./tenor");
+const memory = require("../utils/cloudMemory");
 
 // If the user quoted an image, or sent .cloud as a caption directly on an
 // image, grab it as base64 so it can go to Gemini as vision input.
@@ -43,6 +45,30 @@ async function extractImage(msg) {
   }
 
   return null;
+}
+
+// The brain is OpenRouter (utils/cloudBrain.js) — that's where cloud's
+// personality and per-person memory live. If OpenRouter is unreachable and a
+// Gemini key happens to be configured, fall back to the old path so .cloud
+// still answers instead of dying on a provider wobble.
+async function routeMessage(query, extra, msg) {
+  try {
+    return await brain.routeMessage(query, { ...extra, msg });
+  } catch (err) {
+    if (!process.env.GEMINI_API_KEY) throw err;
+    console.warn(`[cloud] openrouter routing failed (${err.message}), using gemini`);
+    return gemini.routeMessage(query, extra);
+  }
+}
+
+async function answerWithSearch(query, extra, msg) {
+  try {
+    return await brain.answerWithSearch(query, { ...extra, msg });
+  } catch (err) {
+    if (!process.env.GEMINI_API_KEY) throw err;
+    console.warn(`[cloud] openrouter answer failed (${err.message}), using gemini`);
+    return gemini.answerWithSearch(query, extra);
+  }
 }
 
 // Grabs one chapter's images and turns them into a PDF, without going
@@ -123,14 +149,35 @@ async function runTool(name, args, msg) {
 
 /**
  * .cloud <message> — natural-language entry point. Routes to an existing
- * command via Gemini function calling, or falls back to a grounded
- * (google_search) answer for general questions. Returns a Baileys-message
- * shaped object for router.js to send, same convention as the other
- * commands (text / image+caption / audio / document).
+ * command via function calling, or asks the brain for a real answer.
+ * The brain is OpenRouter (utils/cloudBrain.js), with cloud's personality in
+ * utils/cloudPersonality.js and per-person memory in utils/cloudMemory.js.
+ * Returns a Baileys-message shaped object for router.js to send, same
+ * convention as the other commands (text / image+caption / audio / document).
+ *
+ * Also handles `.cloud whoami` and `.cloud forget me` directly.
  */
 async function cmdCloud(sock, msg, argText) {
   const query = (argText || "").trim();
   if (!query) return { text: "usage: .cloud <ask me anything>" };
+
+  // Memory housekeeping, handled locally so it always works even if the AI
+  // provider is down.
+  if (/^(whoami|who am i)$/i.test(query)) {
+    const info = brain.describeMember(msg);
+    const name = info.name || "(not learned yet, tell me and ill remember)";
+    const facts = info.facts.length ? `\nyou remember: ${info.facts.join("; ")}` : "";
+    return {
+      text:
+        `👤 i know you as ${name}\n` +
+        `chat: ${info.isGroup ? "group" : "private"} · saved messages: ${info.turns}${facts}`,
+    };
+  }
+
+  if (/^(forget me|reset|reset memory|clear memory)$/i.test(query)) {
+    memory.forgetPerson(memory.identify(msg));
+    return { text: "🧹 done, i forgot your name and everything we talked about." };
+  }
 
   let image;
   try {
@@ -141,10 +188,11 @@ async function cmdCloud(sock, msg, argText) {
 
   let routed;
   try {
-    routed = await routeMessage(query, {
-      imageBase64: image?.base64,
-      imageMime: image?.mime,
-    });
+    routed = await routeMessage(
+      query,
+      { imageBase64: image?.base64, imageMime: image?.mime },
+      msg
+    );
   } catch (err) {
     return { text: `⚠️ cloud brain isnt working right now: ${err.message}` };
   }
@@ -156,10 +204,11 @@ async function cmdCloud(sock, msg, argText) {
   // gets live info instead of a stale guess.
   if (name === "no_tool_needed") {
     try {
-      const answer = await answerWithSearch(query, {
-        imageBase64: image?.base64,
-        imageMime: image?.mime,
-      });
+      const answer = await answerWithSearch(
+        query,
+        { imageBase64: image?.base64, imageMime: image?.mime },
+        msg
+      );
       return { text: answer };
     } catch (err) {
       return { text: `⚠️ cloud brain isnt working right now: ${err.message}` };
