@@ -1,9 +1,17 @@
-// youtubei.js is ESM-only; this bot is CommonJS, so we load it via dynamic import.
-
-let youtubeModulePromise;
-let cachedClient;
+// YouTube search + video metadata.
+//
+// youtubei.js is ESM-only; this bot is CommonJS, so we load it via dynamic
+// import. Search is tried across several InnerTube clients because YouTube
+// periodically starts rejecting the default one ("Sign in to confirm you're
+// not a bot"), and a different client usually still answers.
 
 const YOUTUBE_ID_RE = /(?:v=|\/embed\/|\/shorts\/|youtu\.be\/|\/v\/)([-_0-9A-Za-z]{11})/;
+
+const SEARCH_CLIENTS = ["WEB", "iOS", "MWEB", "TVHTML5"];
+const CLIENT_TTL_MS = 6 * 60 * 60 * 1000;
+
+let youtubeModulePromise;
+const clientPromises = new Map();
 
 function extractVideoId(input) {
   const value = String(input || "").trim();
@@ -15,7 +23,7 @@ function isYoutubeInput(input) {
   return /(?:youtube\.com|youtu\.be)/i.test(String(input || ""));
 }
 
-async function loadYoutubeModule() {
+function loadYoutubeModule() {
   if (!youtubeModulePromise) {
     youtubeModulePromise = import("youtubei.js").catch((err) => {
       youtubeModulePromise = null;
@@ -25,47 +33,81 @@ async function loadYoutubeModule() {
   return youtubeModulePromise;
 }
 
-async function getClient() {
-  if (cachedClient) return cachedClient;
+async function createClient(clientName) {
   const youtube = await loadYoutubeModule();
-  cachedClient = await youtube.Innertube.create({
+  return youtube.Innertube.create({
+    client_type: clientName,
     cache: new youtube.UniversalCache(false),
     generate_session_locally: true,
+    lang: "en",
+    location: "US",
   });
-  return cachedClient;
+}
+
+function getClientFor(clientName) {
+  const cached = clientPromises.get(clientName);
+  if (cached && Date.now() - cached.createdAt < CLIENT_TTL_MS) return cached.promise;
+
+  const entry = { createdAt: Date.now() };
+  entry.promise = createClient(clientName).catch((err) => {
+    clientPromises.delete(clientName);
+    throw err;
+  });
+  clientPromises.set(clientName, entry);
+  return entry.promise;
+}
+
+async function lookupVideoId(clientName, videoId) {
+  const client = await getClientFor(clientName);
+  const info = await client.getBasicInfo(videoId);
+  const basic = info.basic_info || {};
+  return {
+    id: videoId,
+    title: basic.title || videoId,
+    thumbnail: basic.thumbnail?.[0]?.url || null,
+    author: basic.author || "",
+    durationSec: Math.round(Number(basic.duration) || 0),
+  };
+}
+
+async function searchWithClient(clientName, query) {
+  const client = await getClientFor(clientName);
+  const results = (await client.search(query, { type: "video" })).results || [];
+  const result = results.find((entry) => entry.id && entry.title);
+  if (!result) throw new Error("No YouTube result found for that search");
+
+  return {
+    id: result.id,
+    title: result.title?.text || result.title || query,
+    thumbnail: result.best_thumbnail?.url || result.thumbnails?.[0]?.url || null,
+    author: result.author?.name || "",
+    durationSec: Math.round(Number(result.duration?.seconds) || 0),
+  };
 }
 
 async function searchYoutube(query) {
   const input = String(query || "").trim();
   const directId = extractVideoId(input);
+  const attempts = isYoutubeInput(input) && directId
+    ? SEARCH_CLIENTS.map((client) => () => lookupVideoId(client, directId))
+    : SEARCH_CLIENTS.map((client) => () => searchWithClient(client, input));
 
-  // Direct URL or bare video ID — skip search, just confirm it resolves.
-  if (isYoutubeInput(input) && directId) {
+  const failures = [];
+  for (const attempt of attempts) {
     try {
-      const client = await getClient();
-      const info = await client.getBasicInfo(directId);
-      return {
-        id: directId,
-        title: info.basic_info?.title || directId,
-        thumbnail: info.basic_info?.thumbnail?.[0]?.url || null,
-        author: info.basic_info?.author || "",
-      };
-    } catch {
-      return { id: directId, title: directId, thumbnail: null, author: "" };
+      return await attempt();
+    } catch (err) {
+      failures.push(err.message);
     }
   }
 
-  const client = await getClient();
-  const searchResults = (await client.search(input, { type: "video" })).results || [];
-  const result = searchResults.find((entry) => entry.id && entry.title);
-  if (!result) throw new Error("No YouTube result found for that search");
+  // A direct link or bare video id is still usable for downloading even when
+  // metadata lookup is blocked — the player only needs the id.
+  if (directId && (isYoutubeInput(input) || /^[-_0-9A-Za-z]{11}$/.test(input))) {
+    return { id: directId, title: directId, thumbnail: null, author: "", durationSec: 0 };
+  }
 
-  return {
-    id: result.id,
-    title: result.title?.text || result.title || input,
-    thumbnail: result.thumbnails?.[0]?.url || null,
-    author: result.author?.name || "",
-  };
+  throw new Error(failures[failures.length - 1] || "YouTube search failed");
 }
 
 module.exports = { searchYoutube, extractVideoId };

@@ -1,8 +1,18 @@
-// y2mate-based audio downloader.
-// Ported to CommonJS from a working Levanter-style plugin's fallback path
-// (the part confirmed working: search -> y2mate scrape -> resolve stream -> download buffer).
+// y2mate-based audio downloader — now a *fallback* only.
+//
+// The primary path is YouTube's own InnerTube API (utils/youtube/innertube.js).
+// This file is kept because it can still rescue a video when YouTube refuses
+// every InnerTube client (and because it also handles the odd geo-restricted
+// case). The old code here looked for an option whose quality was exactly
+// "MP3"; y2mate no longer labels its buttons that way, which is what produced
+// the "No audio format was available for that video" reply for every song.
+// We now accept anything that looks audio-ish, and prefer a real MP3 button
+// when the site happens to expose one.
 
-const Y2MATE_BASE = "https://yt1d.io";
+const { mkdir, writeFile } = require("fs/promises");
+const { dirname } = require("path");
+
+const Y2MATE_BASE = (process.env.Y2MATE_BASE || "https://yt1d.io").replace(/\/+$/, "");
 const Y2MATE_AJAX = `${Y2MATE_BASE}/wp-admin/admin-ajax.php`;
 const Y2MATE_RENDER_HOST = "https://fpa-balancer.flashydl.space/get-server";
 const BROWSER_UA =
@@ -41,9 +51,21 @@ async function getY2mateNonces() {
   };
 }
 
+function attrFrom(tag, name) {
+  return tag.match(new RegExp(`data-${name}="([^"]*)"`))?.[1];
+}
+
+function looksLikeAudio(option) {
+  if (option.hasAudio) return true;
+  const label = `${option.quality} ${option.mime} ${option.ext}`.toLowerCase();
+  if (/mp3|m4a|webm|opus|audio/.test(label)) return true;
+  // y2mate labels audio renders as "128kbps", "320kbps", ... 
+  return /\d+\s*kbps/.test(label);
+}
+
 async function fetchY2mateOptions(videoId) {
   const { path, nonce, mergeNonce } = await getY2mateNonces();
-  if (!nonce) throw new Error("y2mate did not return a nonce (site structure may have changed)");
+  if (!nonce) throw new Error("y2mate did not return a nonce");
 
   const response = await fetch(`${Y2MATE_BASE}/results/`, {
     method: "POST",
@@ -61,20 +83,52 @@ async function fetchY2mateOptions(videoId) {
   });
 
   const html = await response.text();
+
   return [...html.matchAll(/<[^>]*data-token="[^"]*"[^>]*>/g)]
-    .map(([tag]) => {
-      const attr = (name) => tag.match(new RegExp(`data-${name}="([^"]*)"`))?.[1];
-      return {
-        token: attr("token"),
-        quality: attr("quality"),
-        hasAudio: attr("has-audio") === "1",
-        size: Number.parseInt(attr("filesize"), 10) || 0,
-        title: attr("title"),
-        mergeId: attr("merge-id"),
-        mergeNonce: attr("merge-nonce") || mergeNonce,
-      };
-    })
-    .filter((option) => option.token && option.quality);
+    .map(([tag]) => ({
+      token: attrFrom(tag, "token"),
+      quality: attrFrom(tag, "quality") || "",
+      mime: attrFrom(tag, "mime") || attrFrom(tag, "type") || "",
+      ext: attrFrom(tag, "ext") || "",
+      hasAudio: attrFrom(tag, "has-audio") === "1" || attrFrom(tag, "audio") === "1",
+      size: Number.parseInt(attrFrom(tag, "filesize"), 10) || 0,
+      title: attrFrom(tag, "title"),
+      mergeId: attrFrom(tag, "merge-id"),
+      mergeNonce: attrFrom(tag, "merge-nonce") || mergeNonce,
+    }))
+    .filter((option) => option.token);
+}
+
+// Rank audio candidates. y2mate's labels are inconsistent ("MP3", "128kbps",
+// "H.264", sometimes with data-has-audio on video rows too), and a naive
+// parseInt would happily read "1080p" as bitrate 1080 — hence real scoring.
+function audioScore(option) {
+  const label = `${option.quality} ${option.mime} ${option.ext}`.toLowerCase();
+  const kbps = Number.parseInt((label.match(/(\d+)\s*kbps/) || [])[1], 10) || 0;
+
+  let score = 0;
+  if (/mp3/.test(label)) score += 1000;
+  if (/kbps/.test(label)) score += 200;
+  if (/audio|m4a|opus|webm/.test(label)) score += 100;
+  if (/^\s*\d{3,4}p\s*$/i.test(option.quality || "")) score -= 500;
+  if (/video/.test(label)) score -= 300;
+
+  return { score, kbps };
+}
+
+function pickAudioOption(options) {
+  const audio = options.filter(looksLikeAudio);
+  if (!audio.length) return null;
+
+  return (
+    audio
+      .slice()
+      .sort((a, b) => {
+        const left = audioScore(a);
+        const right = audioScore(b);
+        return right.score - left.score || right.kbps - left.kbps;
+      })[0] || audio[0]
+  );
 }
 
 async function getY2mateInfo(idOrUrl) {
@@ -85,10 +139,9 @@ async function getY2mateInfo(idOrUrl) {
   const options = await fetchY2mateOptions(videoId);
   if (!options.length) return null;
 
+  const best = pickAudioOption(options);
   const audio = {};
-  for (const option of options) {
-    if (option.quality === "MP3") audio["128kbps mp3"] = option;
-  }
+  if (best) audio[best.quality || "audio"] = best;
 
   const info = {
     id: videoId,
@@ -119,7 +172,7 @@ async function resolveY2mateStreams(option) {
   if (!json.success || !json.data) throw new Error("y2mate stream resolution failed");
 
   return {
-    audioUrl: json.data.audio_url || "",
+    audioUrl: json.data.audio_url || json.data.url || "",
   };
 }
 
@@ -145,7 +198,7 @@ async function startY2mateRender(request, nonce) {
   }
 }
 
-async function waitForY2mateResult(jobId, timeoutMs = 180000) {
+async function waitForY2mateResult(jobId, timeoutMs = 120000) {
   const WebSocket = require("ws");
 
   const hostResponse = await fetch(Y2MATE_RENDER_HOST, {
@@ -192,19 +245,20 @@ async function waitForY2mateResult(jobId, timeoutMs = 180000) {
 
 async function downloadAudioUrl(idOrUrl) {
   const info = y2mateCache.get(String(idOrUrl)) || (await getY2mateInfo(idOrUrl));
-  if (!info) return null;
+  if (!info) throw new Error("y2mate returned no download options");
 
-  const option = info.audio["128kbps mp3"] || Object.values(info.audio)[0];
-  if (!option) return null;
+  const option = Object.values(info.audio)[0];
+  if (!option) throw new Error("y2mate exposed no audio option");
 
   const streams = await resolveY2mateStreams(option);
   if (!streams.audioUrl) throw new Error("y2mate returned no audio stream");
 
+  const isWebm = /webm|opus/i.test(`${option.mime} ${option.ext}`);
   const request = {
     id: `${option.mergeId}_${option.quality}`,
     ttl: 3600000,
     chunk: { size: 209715200, concurrency: 3 },
-    inputs: [{ url: streams.audioUrl, ext: "m4a" }],
+    inputs: [{ url: streams.audioUrl, ext: isWebm ? "webm" : "m4a" }],
     output: {
       ext: "mp3",
       downloadName: `${safeFilename(option.title)}_MP3.mp3`,
@@ -214,7 +268,8 @@ async function downloadAudioUrl(idOrUrl) {
   };
 
   await startY2mateRender(request, option.mergeNonce);
-  return waitForY2mateResult(request.id);
+  const url = await waitForY2mateResult(request.id);
+  return { url, title: option.title || info.title };
 }
 
 async function downloadUrlToBuffer(url, timeout = 180000) {
@@ -233,10 +288,35 @@ async function downloadUrlToBuffer(url, timeout = 180000) {
   }
 }
 
+/**
+ * Fallback entry point: fetch a track through y2mate and write it to `filePath`.
+ * y2mate's render already outputs MP3, so the file is sent as-is.
+ */
+async function downloadY2mateAudioToFile(videoId, filePath) {
+  const { url, title } = await downloadAudioUrl(videoId);
+  const buffer = await downloadUrlToBuffer(url);
+
+  await mkdir(dirname(filePath), { recursive: true });
+  await writeFile(filePath, buffer);
+
+  const info = y2mateCache.get(String(videoId));
+  return {
+    source: "y2mate",
+    mimeType: "audio/mpeg",
+    bytes: buffer.length,
+    title: title || info?.title || "",
+    author: "",
+    durationSec: 0,
+    thumbnail: info?.thumbnail || null,
+  };
+}
+
 module.exports = {
   extractVideoId,
   getY2mateInfo,
   downloadAudioUrl,
   downloadUrlToBuffer,
+  downloadY2mateAudioToFile,
   safeFilename,
+  pickAudioOption,
 };

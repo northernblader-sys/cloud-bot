@@ -318,10 +318,12 @@ async function handleMessage(sock, msg) {
 
     case "play": {
       const result = await playSong(sock, msg, argText);
-      if (result.audio) {
+      // Usually { audio }, but very long tracks come back as { document }
+      // so WhatsApp doesn't reject an oversized inline upload.
+      if (result.audio || result.document) {
         await sock.sendMessage(from, result, { quoted: msg });
       } else {
-        await sock.sendMessage(from, { text: result.text }, { quoted: msg });
+        await sock.sendMessage(from, { text: result.text || "⚠️ That didn't work." }, { quoted: msg });
       }
       break;
     }
