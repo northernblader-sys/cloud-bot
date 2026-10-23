@@ -48,9 +48,18 @@ pm2 save
 | `.fb <url>` | Download a Facebook video/photo |
 | `.dl <url>` | Auto-detect the platform and download |
 
-`.play` fetches audio from three sources, in order, and only accepts a source
-that actually produced audio bytes:
+`.play` fetches audio from several sources, in order, and only accepts a
+source that actually produced audio bytes:
 
+0. **yt-dlp** (`utils/youtube/ytdlp.js`) — the approach desktop downloaders
+   use, and the most reliable of the lot: yt-dlp follows YouTube's anti-bot
+   changes (PO tokens, nsig/sig challenges, new player clients) within days.
+   It runs with a JS runtime (`--js-runtimes node:<this bot's node>`) so it can
+   solve the player challenges, plus
+   `youtube:player_client=default,web_safari`. The binary comes from
+   `YTDLP_PATH`, `<DATA_DIR>/media/bin/`, `yt-dlp` on `PATH`, or is downloaded
+   once from the official GitHub release (`YTDLP_AUTODOWNLOAD=0` disables
+   that).
 1. **YouTube InnerTube** (`utils/youtube/innertube.js`) — several clients are
    tried (TV first, since it still serves audio without a PO token) and the
    first that returns real bytes wins. Highest quality, one request.
@@ -62,8 +71,9 @@ that actually produced audio bytes:
 
 The winning source is streamed in verified byte ranges to a temp file,
 converted to MP3 with ffmpeg, and sent as a WhatsApp audio message (with the
-cover art as a thumbnail). If all three refuse, the reply names the first
-error from each stage instead of a generic message.
+cover art as a thumbnail). If every source refuses, the reply lists one
+line per source with its real error, and — when YouTube is the blocker — points
+at the env var that fixes it.
 
 Notes:
 
@@ -75,6 +85,10 @@ Notes:
   bot"). Optional env vars help there: `YT_PO_TOKEN` (Proof-of-Origin token),
   `YT_VISITOR_DATA`, `YT_COOKIE`, and `YT_CLIENTS` (comma-separated client
   order override, e.g. `TVHTML5,iOS,WEB`).
+- yt-dlp knobs: `YTDLP_PATH` (use a specific binary), `YTDLP_AUTODOWNLOAD=0`
+  (never fetch it automatically), `YT_EXTRACTOR_ARGS` is not needed — the
+  working default is baked in. The binary is stored in `<DATA_DIR>/media/bin/`
+  so it survives restarts on hosts with a persistent volume.
 - Tune the fallback APIs with:
   - `YT_AUDIO_APIS` — order/list of providers, e.g. `piped,cobalt`, or a bare
     template URL `https://api.example/dl?id={id}` whose JSON/text response

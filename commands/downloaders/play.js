@@ -12,6 +12,7 @@ const ffmpegBinary = require2("ffmpeg-static");
 const { searchYoutube } = require("../../utils/y2mate/search");
 const { fetchAudioToFile, cleanupFile, TEMP_DIR } = require("../../utils/youtube/innertube");
 const { fetchAudioFromApis, isLikelyAudio } = require("../../utils/youtube/audioApis");
+const { fetchAudioWithYtdlp, hasYtdlp } = require("../../utils/youtube/ytdlp");
 const { downloadY2mateAudioToFile } = require("../../utils/y2mate/audio");
 
 // WhatsApp tops out around 16 MB for playable audio; stay a bit under it.
@@ -133,31 +134,86 @@ async function fetchThumbnailBuffer(url) {
 // Each stage only wins if it actually produced audio bytes, and each failure
 // is collected so the error we surface says which stage died and why.
 async function downloadAudioSource(videoId, filePath) {
-  const failures = [];
+  const stages = [];
+
+  // Reasons worth surfacing verbatim: they say what to configure.
+  const reasonsOf = (error) =>
+    (error.failures || [])
+      .map((failure) => failure.error || failure.message || String(failure))
+      .filter(Boolean);
+
+  // yt-dlp first when it's already installed: it follows YouTube's anti-bot
+  // changes (PO tokens, nsig challenges) faster than any library can, and it
+  // is the approach proven by desktop downloaders. Autodownloading it is
+  // handled inside (YTDLP_AUTODOWNLOAD=0 disables the ~30 MB fetch).
+  if (hasYtdlp() || process.env.YTDLP_AUTODOWNLOAD !== "0") {
+    try {
+      return await fetchAudioWithYtdlp(videoId, filePath, { maxBytes: MAX_SOURCE_BYTES });
+    } catch (error) {
+      stages.push({ stage: "yt-dlp", error, reasons: reasonsOf(error) });
+      console.warn(`[play] yt-dlp failed, trying InnerTube: ${error.message}`);
+    }
+  }
 
   try {
     return await fetchAudioToFile(videoId, filePath, { maxBytes: MAX_SOURCE_BYTES });
   } catch (error) {
-    failures.push(error.message);
+    stages.push({ stage: "YouTube", error, reasons: reasonsOf(error) });
     console.warn("[play] InnerTube failed, trying public audio APIs");
   }
 
   try {
     return await fetchAudioFromApis(videoId, filePath, { maxBytes: MAX_SOURCE_BYTES });
   } catch (error) {
-    failures.push(error.message);
+    stages.push({ stage: "public APIs", error, reasons: reasonsOf(error) });
     console.warn("[play] public audio APIs failed, trying y2mate");
   }
 
   try {
     return await downloadY2mateAudioToFile(videoId, filePath);
   } catch (error) {
-    failures.push(`y2mate: ${error.message}`);
+    stages.push({ stage: "y2mate", error, reasons: reasonsOf(error) });
   }
 
-  const combined = new Error(failures.join("\n"));
+  const combined = new Error(
+    "every audio source refused this track:\n" +
+      stages
+        .map((entry) => {
+          const detail = entry.reasons[0] || entry.error.message || "unknown error";
+          return `• ${entry.stage}: ${detail}`;
+        })
+        .join("\n")
+  );
   combined.code = "DOWNLOAD_FAILED";
+  combined.stages = stages;
   throw combined;
+}
+
+// One short line per source, each with the most useful reason we have.
+function describeFailure(error) {
+  const stages = error.stages || [];
+  if (!stages.length) return String(error.message || "unknown error").slice(0, 300);
+
+  const lines = stages.map((entry) => {
+    const detail = (entry.reasons[0] || entry.error.message || "failed")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 90);
+    return `• ${entry.stage}: ${detail}`;
+  });
+
+  // If YouTube is asking for a logged-in session, point at the knobs.
+  const youtube = stages.find((entry) => entry.stage === "YouTube");
+  const youtubeText = [youtube?.error?.message, ...(youtube?.reasons || [])].filter(Boolean).join(" ");
+  const youtubeBlocked = /LOGIN_REQUIRED|confirm you.{0,3}re not a bot|bot/i.test(youtubeText);
+  if (youtubeBlocked) {
+    lines.push(
+      "\n_YouTube is asking for a logged-in/PO-token session from this IP. " +
+        "Set YT_COOKIE (or YT_PO_TOKEN), or point PIPED_INSTANCES at an instance that works._"
+    );
+  }
+
+  return lines.join("\n");
 }
 
 async function recompressUnderLimit(sourcePath, outputPath) {
@@ -212,18 +268,11 @@ async function playSong(sock, msg, query) {
       source = await downloadAudioSource(video.id, sourcePath);
     } catch (err) {
       console.error("[play] download failed:", err.message);
-      // First line of each stage's failure, so it's obvious what to fix.
-      const detail = String(err.message)
-        .split("\n")
-        .filter((line) => line && !line.startsWith("•"))
-        .slice(0, 3)
-        .join(" · ");
 
       return {
         text:
-          "⚠️ Couldn't get audio for that one. Every source refused " +
-          "(YouTube, public APIs, y2mate) — usually their anti-bot check " +
-          `blocking this server. Try again in a minute.\n\nDetails: ${detail}`,
+          "⚠️ Couldn't get audio for that one — every source refused.\n\n" +
+          describeFailure(err),
       };
     }
 

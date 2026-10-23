@@ -15,7 +15,7 @@ const Module = require("node:module");
 const os = require("node:os");
 const path = require("node:path");
 const { readFileSync, writeFileSync } = require("node:fs");
-const { mkdtemp } = require("node:fs/promises");
+const { chmod, mkdtemp } = require("node:fs/promises");
 
 const ROOT = path.join(__dirname, "..");
 const inner = require(path.join(ROOT, "utils", "youtube", "innertube.js"));
@@ -192,7 +192,7 @@ test("innertube: reports blocked / audio-less videos instead of pretending", asy
   }
 });
 
-function withPlayDependencies({ innertube, y2mate, audioApis }) {
+function withPlayDependencies({ innertube, y2mate, audioApis, ytdlp }) {
   const playPath = path.join(ROOT, "commands", "downloaders", "play.js");
   const originalLoad = Module._load;
 
@@ -217,6 +217,16 @@ function withPlayDependencies({ innertube, y2mate, audioApis }) {
             throw new Error("public APIs unavailable in this test");
           },
         };
+      }
+      if (request === "../../utils/youtube/ytdlp") {
+        return (
+          ytdlp || {
+            hasYtdlp: () => false,
+            fetchAudioWithYtdlp: async () => {
+              throw new Error("yt-dlp unavailable in this test");
+            },
+          }
+        );
       }
       if (request === "../../utils/y2mate/audio") return { downloadY2mateAudioToFile: y2mate };
     }
@@ -338,9 +348,13 @@ test("play: explains the failure when both sources are blocked", async () => {
   const result = await playSong(fakeSock(), { key: { remoteJid: "1@g.us" } }, "test song");
 
   assert.equal(result.audio, undefined);
-  assert.match(result.text, /anti-bot/);
-  assert.match(result.text, /Details: LOGIN_REQUIRED/);
-  assert.doesNotMatch(result.text, /^\s*⚠️\s*No audio format/);
+  // One line per source, with the real reason — never an empty "Details:".
+  assert.match(result.text, /• YouTube: LOGIN_REQUIRED/);
+  assert.match(result.text, /• public APIs:/);
+  assert.match(result.text, /• y2mate:/);
+  assert.match(result.text, /YT_COOKIE|YT_PO_TOKEN/, "should point at the fix");
+  assert.doesNotMatch(result.text, /Details:\s*$/m);
+  assert.doesNotMatch(result.text, /No audio format/);
 });
 
 test("play: oversized tracks are sent as a document instead of failing", async () => {
@@ -565,4 +579,131 @@ test("apis: magic-number checks recognise real audio containers", () => {
   assert.equal(isLikelyAudio(Buffer.from("<html>blocked</html>")), false);
   assert.equal(isLikelyAudio(Buffer.from('{"error":"nope"}')), false);
   assert.equal(isLikelyAudio(Buffer.alloc(0)), false);
+});
+
+// ── yt-dlp source (utils/youtube/ytdlp.js) ─────────────────────────
+
+async function writeFakeYtdlp(script) {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "ytdlp-bin-"));
+  const bin = path.join(dir, "yt-dlp");
+  writeFileSync(bin, `#!/bin/sh\n${script}\n`);
+  await chmod(bin, 0o755);
+  return bin;
+}
+
+// Emits a fake MP3 to whatever -o template was passed, like the real thing.
+const GOOD_YTDLP = `
+out=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-o" ]; then out="$arg"; fi
+  prev="$arg"
+done
+file=$(printf '%s' "$out" | sed 's/%(ext)s/m4a/')
+printf 'ID3' > "$file"
+head -c 5000 /dev/zero | tr '\\0' 'A' >> "$file"
+printf '{"title":"yt-dlp Song","uploader":"yt-dlp Artist","duration":190}' > "$file.info.json"
+exit 0
+`;
+
+test("ytdlp: downloads audio via the binary and reports metadata", async () => {
+  const bin = await writeFakeYtdlp(GOOD_YTDLP);
+  const ytdlp = require(path.join(ROOT, "utils", "youtube", "ytdlp.js"));
+  const dir = await mkdtemp(path.join(os.tmpdir(), "ytdlp-out-"));
+  const file = path.join(dir, "track.source");
+
+  process.env.YTDLP_PATH = bin;
+  ytdlp._reset();
+
+  try {
+    const result = await ytdlp.fetchAudioWithYtdlp("video-id", file);
+
+    assert.equal(result.source, "yt-dlp");
+    assert.equal(result.bytes, 5003);
+    assert.equal(result.title, "yt-dlp Song");
+    assert.equal(result.author, "yt-dlp Artist");
+    assert.equal(result.durationSec, 190);
+    assert.equal(result.mimeType, "audio/mp4");
+    assert.ok(readFileSync(file).subarray(0, 3).toString() === "ID3");
+  } finally {
+    delete process.env.YTDLP_PATH;
+    ytdlp._reset();
+  }
+});
+
+test("ytdlp: surfaces the real error and never accepts garbage output", async () => {
+  const ytdlp = require(path.join(ROOT, "utils", "youtube", "ytdlp.js"));
+  const dir = await mkdtemp(path.join(os.tmpdir(), "ytdlp-out-"));
+
+  // 1) hard failure -> stderr is surfaced
+  process.env.YTDLP_PATH = await writeFakeYtdlp(
+    'echo "ERROR: [youtube] video-id: Sign in to confirm you are not a bot" >&2\nexit 1'
+  );
+  ytdlp._reset();
+  await assert.rejects(ytdlp.fetchAudioWithYtdlp("video-id", path.join(dir, "a.bin")), (err) => {
+    assert.match(err.message, /Sign in to confirm/i);
+    return true;
+  });
+
+  // 2) exit 0 but HTML written -> rejected
+  process.env.YTDLP_PATH = await writeFakeYtdlp(`
+out=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-o" ]; then out="$arg"; fi
+  prev="$arg"
+done
+file=$(printf '%s' "$out" | sed 's/%(ext)s/m4a/')
+printf '<html>blocked</html>' > "$file"
+exit 0
+`);
+  ytdlp._reset();
+  await assert.rejects(ytdlp.fetchAudioWithYtdlp("video-id", path.join(dir, "b.bin")), (err) => {
+    assert.match(err.message, /not audio/i);
+    return true;
+  });
+
+  delete process.env.YTDLP_PATH;
+  ytdlp._reset();
+});
+
+test("play: prefers yt-dlp, then InnerTube, then APIs, then y2mate", async () => {
+  const calls = [];
+  const write = (file, byte) => writeFileSync(file, Buffer.concat([Buffer.from("ID3"), Buffer.alloc(2048, byte)]));
+
+  const playSong = withPlayDependencies({
+    ytdlp: {
+      hasYtdlp: () => true,
+      fetchAudioWithYtdlp: async (id, file) => {
+        calls.push("ytdlp");
+        write(file, 1);
+        return { source: "yt-dlp", mimeType: "audio/mpeg", title: "T", durationSec: 180 };
+      },
+    },
+    innertube: {
+      ...idleCleanup,
+      fetchAudioToFile: async (id, file) => {
+        calls.push("innertube");
+        write(file, 2);
+        return { mimeType: "audio/mpeg", title: "T", durationSec: 180 };
+      },
+    },
+    audioApis: {
+      isLikelyAudio: realIsLikelyAudio,
+      fetchAudioFromApis: async (id, file) => {
+        calls.push("apis");
+        write(file, 3);
+        return { mimeType: "audio/mpeg", title: "T", durationSec: 180 };
+      },
+    },
+    y2mate: async (id, file) => {
+      calls.push("y2mate");
+      write(file, 4);
+      return { mimeType: "audio/mpeg", title: "T", durationSec: 180 };
+    },
+  });
+
+  const result = await playSong(fakeSock(), { key: { remoteJid: "1@g.us" } }, "song");
+  assert.ok(Buffer.isBuffer(result.audio));
+  assert.deepEqual(calls, ["ytdlp"], "the first working source wins");
 });
