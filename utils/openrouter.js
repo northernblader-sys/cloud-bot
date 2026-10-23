@@ -8,18 +8,24 @@
 //
 //   1. process.env.OPENROUTER_API_KEY        <- set this on the host (Render,
 //                                               Railway, VPS…). Recommended.
-//   2. <DATA_DIR>/openrouter.key             <- one-line file next to the
-//                                               bot's data (gitignored, and
-//                                               survives restarts on hosts
-//                                               with a persistent volume).
+//   2. the key saved at runtime              <- send `.cloud key sk-or-v1-…`
+//                                               to the bot in a DM as the owner.
+//                                               Stored through utils/persist.js,
+//                                               so it lands in MongoDB when
+//                                               MONGODB_URI is set and survives
+//                                               redeploys.
+//   3. <DATA_DIR>/openrouter.key             <- one-line file next to the
+//                                               bot's data (gitignored; only
+//                                               survives on a persistent disk).
 //
-// If neither is present the command says exactly that instead of failing
-// silently. utils/openrouter.key.example shows the two ways to set it.
+// If none is present the command says exactly that instead of failing
+// silently. utils/openrouter.key.example shows every way to set it.
 
 const fs = require("fs");
 const path = require("path");
 
 const { DATA_DIR } = require("./dataDir");
+const persist = require("./persist");
 
 const API_URL = "https://openrouter.ai/api/v1/chat/completions";
 
@@ -35,10 +41,57 @@ const SITE_NAME = "astral cloud";
 const REQUEST_TIMEOUT_MS = 60000;
 
 const KEY_FILE = path.join(DATA_DIR, "openrouter.key");
+const KEY_STORE = "openrouterKey"; // runtime-saved key (persist -> Mongo/JSON)
+
+/** The key saved with `.cloud key …`, or null. */
+function storedKey() {
+  const value = persist.get(KEY_STORE, null);
+  if (!value) return null;
+  const key = typeof value === "string" ? value : value.key;
+  return key && String(key).trim() ? String(key).trim() : null;
+}
+
+/** Save a key at runtime. `by` is recorded for the log only, never shown. */
+function setApiKey(key, by = null) {
+  const clean = String(key || "").trim();
+  if (!/^sk-or-v1-[A-Za-z0-9]{20,}$/.test(clean)) {
+    throw new Error("that doesn't look like an openrouter key (it should start with sk-or-v1-)");
+  }
+  persist.set(KEY_STORE, { key: clean, savedAt: Date.now(), by });
+  return clean;
+}
+
+function clearApiKey() {
+  const existed = Boolean(storedKey());
+  persist.set(KEY_STORE, null);
+  return existed;
+}
+
+/** sk-or-v1-…abcd -> sk-or-v1-•••abcd (never log or send a full key). */
+function maskKey(key) {
+  const value = String(key || "");
+  if (value.length < 12) return "•••";
+  return `${value.slice(0, 9)}•••${value.slice(-4)}`;
+}
+
+/** Which source the current key comes from: "env" | "saved" | "file" | null. */
+function keySource() {
+  if (process.env.OPENROUTER_API_KEY && process.env.OPENROUTER_API_KEY.trim()) return "env";
+  if (storedKey()) return "saved";
+  try {
+    if (fs.readFileSync(KEY_FILE, "utf8").trim()) return "file";
+  } catch {
+    // no key file
+  }
+  return null;
+}
 
 function apiKey() {
   const fromEnv = process.env.OPENROUTER_API_KEY;
   if (fromEnv && fromEnv.trim()) return fromEnv.trim();
+
+  const saved = storedKey();
+  if (saved) return saved;
 
   try {
     const fromFile = fs.readFileSync(KEY_FILE, "utf8").trim();
@@ -48,8 +101,8 @@ function apiKey() {
   }
 
   const error = new Error(
-    "no OpenRouter key configured. set OPENROUTER_API_KEY in the environment, " +
-      `or put the key on its own line in ${KEY_FILE}`
+    "no openrouter key yet. dm the bot `.cloud key sk-or-v1-...` as the owner, " +
+      "or set OPENROUTER_API_KEY on the host"
   );
   error.code = "NO_API_KEY";
   throw error;
@@ -170,6 +223,11 @@ module.exports = {
   chatWithRetry,
   apiKey,
   hasKey,
+  setApiKey,
+  clearApiKey,
+  storedKey,
+  maskKey,
+  keySource,
   KEY_FILE,
   modelName,
   DEFAULT_MODEL,

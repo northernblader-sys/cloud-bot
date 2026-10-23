@@ -307,3 +307,122 @@ test("brain: a reply's <remember> tag is stored and never sent to whatsapp", asy
     stub.restore();
   }
 });
+
+// ── key management (owner-only, DM-only, never echoed) ─────────────
+
+function loadCloudCommand() {
+  const cloudPath = path.join(ROOT, "commands", "cloud.js");
+  delete require.cache[require.resolve(cloudPath)];
+  return require(cloudPath);
+}
+
+test("keys: an owner can save a key in a DM and it becomes the active key", async () => {
+  const savedEnvKey = process.env.OPENROUTER_API_KEY;
+  delete process.env.OPENROUTER_API_KEY;
+  const openrouter = require(path.join(ROOT, "utils", "openrouter.js"));
+
+  const stub = stubFetch(() =>
+    jsonResponse({ choices: [{ message: { content: "ok" } }] })
+  );
+
+  // owner DM: isOwnerMessage is env-driven, so point OWNER_NUMBERS at us
+  const original = process.env.OWNER_NUMBERS;
+  process.env.OWNER_NUMBERS = "2348000000001";
+  delete require.cache[require.resolve(path.join(ROOT, "utils", "owner.js"))];
+  const { cmdCloud: cloud } = loadCloudCommand();
+
+  try {
+    openrouter.clearApiKey();
+
+    const result = await cloud(
+      {},
+      { key: { remoteJid: "2348000000001@s.whatsapp.net", participant: undefined } },
+      "key sk-or-v1-abcdefghijklmnopqrstuvwxyz123456"
+    );
+
+    assert.match(result.text, /key saved and working/i);
+    assert.doesNotMatch(result.text, /sk-or-v1-abcdefghijklmnopqrstuvwxyz123456/, "full key must never be echoed");
+    assert.equal(openrouter.keySource(), "saved");
+    assert.equal(openrouter.apiKey(), "sk-or-v1-abcdefghijklmnopqrstuvwxyz123456");
+  } finally {
+    openrouter.clearApiKey();
+    stub.restore();
+    process.env.OWNER_NUMBERS = original;
+    process.env.OPENROUTER_API_KEY = savedEnvKey;
+    delete require.cache[require.resolve(path.join(ROOT, "utils", "owner.js"))];
+  }
+});
+
+test("keys: refused from a group chat, and from non-owners", async () => {
+  const savedEnvKey = process.env.OPENROUTER_API_KEY;
+  delete process.env.OPENROUTER_API_KEY;
+  const openrouter = require(path.join(ROOT, "utils", "openrouter.js"));
+  const original = process.env.OWNER_NUMBERS;
+  process.env.OWNER_NUMBERS = "2348000000001";
+  delete require.cache[require.resolve(path.join(ROOT, "utils", "owner.js"))];
+  const { cmdCloud } = loadCloudCommand();
+
+  try {
+    openrouter.clearApiKey();
+
+    // owner, but in a group -> refuse, and do not store
+    const inGroup = await cmdCloud(
+      {},
+      { key: { remoteJid: "1203630@g.us", participant: "2348000000001@s.whatsapp.net" } },
+      "key sk-or-v1-abcdefghijklmnopqrstuvwxyz123456"
+    );
+    assert.match(inGroup.text, /dm me the key/i);
+    assert.equal(openrouter.storedKey(), null);
+
+    // not the owner -> refuse
+    const stranger = await cmdCloud(
+      {},
+      { key: { remoteJid: "2348999999999@s.whatsapp.net" } },
+      "key sk-or-v1-abcdefghijklmnopqrstuvwxyz123456"
+    );
+    assert.match(stranger.text, /only the owner/i);
+    assert.equal(openrouter.storedKey(), null);
+  } finally {
+    openrouter.clearApiKey();
+    process.env.OWNER_NUMBERS = original;
+    process.env.OPENROUTER_API_KEY = savedEnvKey;
+    delete require.cache[require.resolve(path.join(ROOT, "utils", "owner.js"))];
+  }
+});
+
+test("keys: junk is rejected, .cloud key reports status, clear removes it", async () => {
+  const savedEnvKey = process.env.OPENROUTER_API_KEY;
+  delete process.env.OPENROUTER_API_KEY;
+  const openrouter = require(path.join(ROOT, "utils", "openrouter.js"));
+  const original = process.env.OWNER_NUMBERS;
+  process.env.OWNER_NUMBERS = "2348000000001";
+  delete require.cache[require.resolve(path.join(ROOT, "utils", "owner.js"))];
+  const { cmdCloud } = loadCloudCommand();
+
+  const ownerDm = { key: { remoteJid: "2348000000001@s.whatsapp.net" } };
+
+  try {
+    openrouter.clearApiKey();
+
+    const status = await cmdCloud({}, ownerDm, "key");
+    assert.match(status.text, /no key saved yet/i);
+
+    const junk = await cmdCloud({}, ownerDm, "key hello-world");
+    assert.match(junk.text, /sk-or-v1-/);
+
+    openrouter.setApiKey("sk-or-v1-abcdefghijklmnopqrstuvwxyz123456");
+
+    const saved = await cmdCloud({}, ownerDm, "key");
+    assert.match(saved.text, /sk-or-v1-•••3456/);
+    assert.doesNotMatch(saved.text, /abcdefghijklmnop/);
+
+    const cleared = await cmdCloud({}, ownerDm, "key clear");
+    assert.match(cleared.text, /key removed/i);
+    assert.equal(openrouter.keySource(), null);
+  } finally {
+    openrouter.clearApiKey();
+    process.env.OWNER_NUMBERS = original;
+    process.env.OPENROUTER_API_KEY = savedEnvKey;
+    delete require.cache[require.resolve(path.join(ROOT, "utils", "owner.js"))];
+  }
+});

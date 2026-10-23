@@ -31,6 +31,7 @@ const { randomUUID } = require("crypto");
 const { tmpdir } = require("os");
 
 const { isLikelyAudio } = require("./audioApis");
+const session = require("./session");
 const { BASE_DIR } = require("../dataDir");
 
 const BIN_DIR = join(BASE_DIR, "media", "bin");
@@ -260,7 +261,7 @@ function classifyYtdlpError(text) {
   return { kind: "other", retryable: true, fix: null };
 }
 
-// ── Arroxy's ladder ────────────────────────────────────────────────
+// ── client ladder ──────────────────────────────────────────────────
 // Arroxy (github.com/antonio-orionus/Arroxy) runs a 3-attempt ladder:
 //
 //   0. PO token + visitor data, player_client=default   (token-bound clients)
@@ -272,7 +273,35 @@ function classifyYtdlpError(text) {
 // without BotGuard (Arroxy drives a hidden Electron window), but we honour
 // YT_PO_TOKEN + YT_VISITOR_DATA if given — and yt-dlp drops a GVS token that
 // arrives without visitor data, which is why we scrape it.
+//
+// What we add on top: YouTube blocks *clients*, not just IPs, so after a
+// "Sign in to confirm you're not a bot" the useful move is to change client,
+// not to repeat the same request. Each entry below is one client group yt-dlp
+// knows; the ladder walks them until one is let through.
 const ARROXY_FALLBACK_CLIENTS = "youtube:player_client=default,-web,-web_safari";
+
+// Without cookies these are the clients that historically answer first from
+// datacenter IPs. tv/tv_simply are plain URLs, android_vr/ios need no PO token
+// for most videos, and mweb is the least-hammered web surface.
+const CLIENT_LADDER = [
+  "youtube:player_client=tv_simply,tv",
+  "youtube:player_client=android_vr",
+  "youtube:player_client=ios",
+  "youtube:player_client=mweb,web_safari",
+  ARROXY_FALLBACK_CLIENTS,
+];
+
+// With cookies the session is the thing YouTube wants, and the web clients are
+// the ones that actually use it — so lead with those.
+const COOKIE_CLIENT_LADDER = [
+  null, // yt-dlp's own defaults, which already include tv + web_safari
+  "youtube:player_client=web_safari,web,mweb",
+  "youtube:player_client=tv_simply,tv",
+];
+
+function clientLadder(hasCookies) {
+  return hasCookies ? COOKIE_CLIENT_LADDER : CLIENT_LADDER;
+}
 
 function looksLikeUnsupportedOption(stderr) {
   return /unrecognized arguments|no such option|unknown option|invalid choice/i.test(stderr || "");
@@ -292,56 +321,104 @@ function poTokenArgs(poToken, visitorData) {
   return `youtube:player_client=default;po_token=web.gvs+${poToken};visitor_data=${visitorData}`;
 }
 
+/** The --extractor-args value of an attempt, or "default" when it has none. */
+function extractorArgsOf(args) {
+  const index = args.indexOf("--extractor-args");
+  return index >= 0 && args[index + 1] ? args[index + 1] : "default";
+}
+
+function shortLabel(extractorArgs) {
+  if (!extractorArgs || extractorArgs === "default") return "yt-dlp defaults";
+  return String(extractorArgs).replace(/^youtube:player_client=/, "").replace(/;.*$/, "");
+}
+
+// YouTube's block is per-IP, so once a client group has been refused in the
+// last few minutes there is no point asking it again — the second strategy in
+// one `.play` would otherwise repeat every attempt the first one just made.
+const BLOCK_MEMO_MS = 10 * 60 * 1000;
+const blockedAttempts = new Map(); // `${cookies}|${extractorArgs}` -> timestamp
+
+function memoKey(extractorArgs, cookieState) {
+  return `${cookieState}|${extractorArgs}`;
+}
+
+function knownBlock(extractorArgs, cookieState) {
+  const entry = blockedAttempts.get(memoKey(extractorArgs, cookieState));
+  if (!entry) return null;
+  if (Date.now() - entry.at > BLOCK_MEMO_MS) {
+    blockedAttempts.delete(memoKey(extractorArgs, cookieState));
+    return null;
+  }
+  return entry;
+}
+
+function rememberBlocked(extractorArgs, cookieState, message) {
+  // Keep the original stderr: later attempts are skipped, and the user still
+  // deserves the real reason rather than "skipped".
+  blockedAttempts.set(memoKey(extractorArgs, cookieState), { at: Date.now(), message });
+}
+
+const SHARED_ARGS = (url, template) => [
+  url,
+  "-f",
+  "bestaudio/best",
+  "-o",
+  template,
+  "--ignore-config",
+  "--no-playlist",
+  "--no-part",
+  "--continue",
+  "--newline",
+  "--no-warnings",
+  "--write-info-json",
+  // Arroxy's download hardening: chunked HTTP, bounded retries, no silent
+  // half-files, and a socket timeout so a stalled read can't hang the job.
+  "--http-chunk-size",
+  "10M",
+  "--retries",
+  "5",
+  "--fragment-retries",
+  "5",
+  "--retry-sleep",
+  "1:3",
+  "--socket-timeout",
+  "20",
+  "--abort-on-unavailable-fragments",
+];
+
+function cookieArgs(cookiePath) {
+  return cookiePath ? ["--cookies", cookiePath] : [];
+}
+
 /**
  * Build the ordered attempt list for the Arroxy strategy.
  * Exported for tests; each entry is {label, args}.
  */
-function arroxyLadder({ url, template, poToken, visitorData }) {
-  const base = [
-    url,
-    "-f",
-    "bestaudio/best",
-    "-o",
-    template,
-    "--ignore-config",
-    "--no-playlist",
-    "--no-part",
-    "--continue",
-    "--newline",
-    "--no-warnings",
-    "--write-info-json",
-    // Arroxy's download hardening: chunked HTTP, bounded retries, no silent
-    // half-files, and a socket timeout so a stalled read can't hang the job.
-    "--http-chunk-size",
-    "10M",
-    "--retries",
-    "5",
-    "--fragment-retries",
-    "5",
-    "--retry-sleep",
-    "1:3",
-    "--socket-timeout",
-    "20",
-    "--abort-on-unavailable-fragments",
-  ];
-
+function arroxyLadder({ url, template, poToken, visitorData, cookiePath }) {
+  const base = [...SHARED_ARGS(url, template), ...cookieArgs(cookiePath)];
   const js = jsRuntimeArgs();
   const attempts = [];
 
   // 0. A PO token only helps when paired with the visitor data it is bound to.
-  const withToken = poTokenArgs(poToken, visitorData);
+  //    It is pointless alongside cookies, and yt-dlp refuses that combination.
+  const withToken = cookiePath ? null : poTokenArgs(poToken, visitorData);
   if (withToken) {
     attempts.push({ label: "po-token", args: [...base, ...js, "--extractor-args", withToken] });
   }
 
-  // 1. VidBee's trick: drop the clients that demand a PO token.
-  attempts.push({
-    label: "no-pot-clients",
-    args: [...base, ...js, "--extractor-args", ARROXY_FALLBACK_CLIENTS],
-  });
+  // 1. Walk the client ladder.
+  for (const extractorArgs of clientLadder(Boolean(cookiePath))) {
+    attempts.push({
+      label: shortLabel(extractorArgs),
+      args: extractorArgs ? [...base, ...js, "--extractor-args", extractorArgs] : [...base, ...js],
+    });
+  }
 
-  // 2. Let yt-dlp pick its own clients.
-  attempts.push({ label: "no-extractor-args", args: [...base, ...js] });
+  // 2. If even that fails, try without the node runtime hint: an old build may
+  //    reject --js-runtimes outright.
+  if (!cookiePath) {
+    attempts.push({ label: "no-extractor-args", args: [...base] });
+  }
 
   return attempts;
 }
@@ -387,11 +464,15 @@ async function getVisitorData() {
 /**
  * Download the audio for `videoId` into `filePath`.
  *
- * strategy "basic"  — the desktop-app recipe (single attempt plus flag
- *                      downgrades for older yt-dlp builds).
- * strategy "arroxy" — Arroxy's ladder: PO token (if configured) →
- *                      non-PoT clients → yt-dlp defaults, stopping early on
- *                      rate limits or unavailable videos.
+ * strategy "basic"  — the desktop-app recipe first (Refloow), then the client
+ *                      ladder, so a bot-blocked client doesn't end the run.
+ * strategy "arroxy" — Arroxy's ladder: PO token (if configured) → client
+ *                      ladder → yt-dlp defaults, stopping early on rate
+ *                      limits or unavailable videos.
+ *
+ * Cookies come from utils/youtube/session.js when configured and are passed as
+ * `--cookies`, which is what actually gets past "Sign in to confirm you're not
+ * a bot" on a datacenter IP.
  */
 async function fetchAudioWithYtdlp(videoId, filePath, options = {}) {
   const { maxBytes = 300 * 1024 * 1024, strategy = "basic" } = options;
@@ -402,13 +483,17 @@ async function fetchAudioWithYtdlp(videoId, filePath, options = {}) {
   const template = join(TEMP_DIR, `ytdlp-${workId}.%(ext)s`);
   const url = `https://www.youtube.com/watch?v=${videoId}`;
 
+  // Writing the cookie file is cheap and idempotent; null when none are set.
+  const cookiePath = session.cookieFile();
+  const cookieState = cookiePath ? session.source() || "file" : "none";
+
   let attempts;
   if (strategy === "arroxy") {
     // A GVS token is only usable together with the visitor data it is bound
     // to, so scrape that first when a token is configured.
     const poToken = process.env.YT_PO_TOKEN;
     const visitorData = poToken ? await getVisitorData() : null;
-    attempts = arroxyLadder({ url, template, poToken, visitorData }).map((entry) => ({
+    attempts = arroxyLadder({ url, template, poToken, visitorData, cookiePath }).map((entry) => ({
       ...entry,
       // Arroxy ends the ladder at a rate limit: another request now only meets
       // the same limit. An unavailable video won't change either.
@@ -417,8 +502,8 @@ async function fetchAudioWithYtdlp(videoId, filePath, options = {}) {
   } else {
     // `--js-runtimes` accepts RUNTIME[:PATH]; pinning the bot's own Node binary
     // means yt-dlp can solve the player JS challenges even when node isn't on
-    // PATH. Older yt-dlp builds don't know the flag at all, hence the
-    // progressively simpler fallbacks.
+    // PATH. Older yt-dlp builds don't know the flag at all, hence the final
+    // attempt without it.
     const base = [
       url,
       "-f",
@@ -434,21 +519,26 @@ async function fetchAudioWithYtdlp(videoId, filePath, options = {}) {
       "20",
       "--retries",
       "3",
+      ...cookieArgs(cookiePath),
     ];
 
-    attempts = [
-      [...base, "--js-runtimes", `node:${process.execPath}`, "--extractor-args", EXTRACTOR_ARGS],
-      [...base, "--js-runtimes", "node", "--extractor-args", EXTRACTOR_ARGS],
-      [...base, "--js-runtimes", "node"],
-      base,
-    ].map((args, index) => ({
-      label: `basic-${index + 1}`,
-      args,
-      stopKinds: ["rateLimit"],
-      // Only retry with fewer flags when the failure looks like a flag issue;
-      // otherwise the next attempt would fail identically.
-      flagSensitive: true,
+    const js = ["--js-runtimes", `node:${process.execPath}`];
+
+    // Refloow's recipe first (EXTRACTOR_ARGS), then the client ladder. A
+    // "Sign in to confirm you're not a bot" is the normal failure here, so the
+    // run has to be able to change client rather than give up.
+    const variants = [EXTRACTOR_ARGS, ...clientLadder(Boolean(cookiePath))];
+
+    attempts = variants.map((extractorArgs, index) => ({
+      label: `basic-${index + 1} (${shortLabel(extractorArgs)})`,
+      args: extractorArgs
+        ? [...base, ...js, "--extractor-args", extractorArgs]
+        : [...base, ...js],
+      stopKinds: ["rateLimit", "unavailable", "missingDependency"],
     }));
+
+    // Last resort for older binaries: no JS runtime flags at all.
+    attempts.push({ label: "basic-plain", args: [...base], stopKinds: ["rateLimit"] });
   }
 
   const failures = [];
@@ -456,6 +546,20 @@ async function fetchAudioWithYtdlp(videoId, filePath, options = {}) {
 
   try {
     for (const attempt of attempts) {
+      const extractorArgs = extractorArgsOf(attempt.args);
+
+      // Skip a client group already refused minutes ago from this IP.
+      const blocked = knownBlock(extractorArgs, cookieState);
+      if (blocked) {
+        failures.push({
+          label: attempt.label,
+          message: blocked.message || "blocked a moment ago",
+          kind: "botBlock",
+          skipped: true,
+        });
+        continue;
+      }
+
       try {
         await runYtdlp(binary, attempt.args);
         produced = await findOutput(workId);
@@ -474,13 +578,22 @@ async function fetchAudioWithYtdlp(videoId, filePath, options = {}) {
           fix: classification.fix,
         });
 
+        if (classification.kind === "botBlock") {
+          rememberBlocked(extractorArgs, cookieState, err.message);
+        }
+
         if (attempt.stopKinds?.includes(classification.kind)) break;
-        if (attempt.flagSensitive && !looksLikeUnsupportedOption(err.stderr || err.message)) break;
+        // A non-retryable kind (a removed video, a 429) fails identically on
+        // every client, so stop instead of burning minutes.
+        if (!classification.retryable) break;
       }
     }
 
     if (!produced) {
-      const lastFailure = failures[failures.length - 1];
+      // Prefer a real failure over "skipped because it was blocked a moment
+      // ago" — that message means nothing on its own.
+      const lastFailure =
+        [...failures].reverse().find((entry) => !entry.skipped) || failures[failures.length - 1];
       const error = new Error(lastFailure ? lastFailure.message : "yt-dlp produced no output");
       error.kind = lastFailure?.kind || "other";
       error.fix = lastFailure?.fix || null;
@@ -587,5 +700,6 @@ module.exports = {
   _reset: () => {
     cachedBinary = null;
     resolvePromise = null;
+    blockedAttempts.clear();
   },
 };

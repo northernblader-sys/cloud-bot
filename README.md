@@ -44,11 +44,19 @@ commands, or answers it conversationally.
 
 - **Model:** OpenRouter (`utils/openrouter.js`), `openai/gpt-4o-mini` by
   default — cheap, fast, handles tool calling and images. Set
-  `OPENROUTER_MODEL` to switch (e.g. `openai/gpt-4o`). The key is read from
-  `OPENROUTER_API_KEY`, or from `<DATA_DIR>/openrouter.key` (one line,
-  gitignored) — see `utils/openrouter.key.example`. It is deliberately not
-  committed: GitHub's push protection rejects live credentials in a public
-  repo, and anyone who could read the file could spend against it.
+  `OPENROUTER_MODEL` to switch (e.g. `openai/gpt-4o`). The key is read from,
+  in order: `OPENROUTER_API_KEY`, a key saved at runtime, or
+  `<DATA_DIR>/openrouter.key` (see `utils/openrouter.key.example`). It is
+  deliberately not committed: GitHub's push protection rejects live
+  credentials in a public repo, and anyone who could read the file could spend
+  against it.
+
+  Quickest way to set it: **DM the bot** `.cloud key sk-or-v1-...` as the
+  owner. It is stored through `utils/persist.js` (MongoDB when
+  `MONGODB_URI` is set, otherwise the local data dir), validated, and tested
+  with a real call before it confirms. `.cloud key` shows the masked key and
+  where it came from; `.cloud key clear` removes it. Keys are refused in group
+  chats so they never end up in chat history.
 - **Personality:** `utils/cloudPersonality.js` — identity, tone rules, voice
   examples and reply clean-up (no em dashes, no markdown). Edit this file to
   change how cloud talks; nothing else needs touching.
@@ -138,6 +146,62 @@ down without notice. If one stops working, the fix is updating the relevant
 fetch function in `utils/downloaders/fetchers.js`.
 
 Replying to a message that contains a supported link also works for `.dl`.
+
+## When `.play` says "every source refused"
+
+On a datacenter host (Render, Railway, Fly, any VPS) YouTube answers
+**"Sign in to confirm you're not a bot"** for every client — yt-dlp, InnerTube,
+public frontends alike. It is not a bug in the bot: YouTube wants an
+account-backed session from IPs it doesn't trust. The bot now knows this and
+tells you so.
+
+**The fix is one message.** In a browser, sign in to YouTube, export cookies
+with the "Get cookies.txt LOCALLY" extension, then:
+
+```sh
+base64 -w0 cookies.txt        # macOS: base64 -i cookies.txt
+```
+
+DM the bot (owner only, never in a group):
+
+```
+.play cookie <paste that text>
+```
+
+Only **Google/YouTube cookies** are kept: a browser export also contains
+whatever else that browser is signed in to (dashboards, payment, captcha), and
+none of that is stored, written to the cookie file, or sent anywhere. It is
+validated (a visitor-only export with no `SID`/`HSID` is rejected with an
+explanation), stored through `utils/persist.js` — so in MongoDB when
+`MONGODB_URI` is set, surviving redeploys — and written to a `cookies.txt` that
+yt-dlp is given via `--cookies` and InnerTube via its session. Cookie values are
+never echoed back or logged.
+
+- `.play cookie` — state: how many cookies, signed-in or visitor export, source, age
+- `.play cookie clear` — remove them
+
+Hosts can set the same thing without chat instead:
+`YT_COOKIES_B64` (base64), `YT_COOKIES` (the file contents), `YT_COOKIE` (a
+`SID=…; HSID=…` header), or `YT_COOKIES_FILE` (a path).
+
+Cookies expire after a few months; when `.play` starts blocking again,
+re-export and resend.
+
+### What else changed for this
+
+- **Client ladder.** A bot block is per-client as well as per-IP, so yt-dlp now
+  walks `tv_simply,tv` → `android_vr` → `ios` → `mweb,web_safari` →
+  `default,-web,-web_safari` → its own defaults (or, with cookies,
+  defaults → `web_safari,web,mweb` → `tv_simply,tv`) instead of repeating one
+  refused request. With cookies, no PO-token attempt is made — yt-dlp refuses
+  that combination.
+- **No repeated pain.** A client group refused in the last 10 minutes is
+  skipped for subsequent attempts, so the second yt-dlp pass doesn't re-hammer
+  YouTube, and the user still sees the original reason.
+- **InnerTube** asks the web clients first when cookies exist (they're the ones
+  that use a session), and a null player response now reports "YouTube's player
+  data was incomplete (this client is being throttled)" instead of the
+  meaningless `Cannot read properties of null (reading 'as')`.
 
 ## Welcome verification
 

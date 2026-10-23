@@ -19,6 +19,8 @@ const { calculate } = require("./calc");
 const { shortenUrl } = require("./shorten");
 const { tenorSticker } = require("./tenor");
 const memory = require("../utils/cloudMemory");
+const openrouter = require("../utils/openrouter");
+const { isOwnerMessage } = require("../utils/owner");
 
 // If the user quoted an image, or sent .cloud as a caption directly on an
 // image, grab it as base64 so it can go to Gemini as vision input.
@@ -160,6 +162,69 @@ async function runTool(name, args, msg) {
 async function cmdCloud(sock, msg, argText) {
   const query = (argText || "").trim();
   if (!query) return { text: "usage: .cloud <ask me anything>" };
+
+  // Brain key management. Owner only, and only in a DM — a key pasted into a
+  // group chat is visible to everyone in it forever.
+  const keyCommand = query.match(/^key(?:\s+(.*))?$/i);
+  if (keyCommand) {
+    if (!isOwnerMessage(msg)) return { text: "only the owner can do that." };
+    const isDm = !String(msg.key.remoteJid || "").endsWith("@g.us");
+    const arg = (keyCommand[1] || "").trim();
+
+    if (!isDm) {
+      return {
+        text: "dm me the key instead, not here — anyone in this group could read it.",
+      };
+    }
+
+    if (!arg) {
+      const source = openrouter.keySource();
+      if (!source) {
+        return {
+          text:
+            "no key saved yet.\n\nsend: .cloud key sk-or-v1-...\n" +
+            "(you can create one at openrouter.ai/keys)",
+        };
+      }
+      const label = { env: "environment variable", saved: "saved by you", file: "key file" }[source];
+      return {
+        text:
+          `🔑 openrouter key active (${label}): ${openrouter.maskKey(openrouter.apiKey())}\n\n` +
+          "send .cloud key <new key> to replace it, or .cloud key clear to remove it.",
+      };
+    }
+
+    if (/^(clear|remove|delete)$/i.test(arg)) {
+      const removed = openrouter.clearApiKey();
+      return { text: removed ? "🧹 key removed." : "there was no saved key to remove." };
+    }
+
+    try {
+      openrouter.setApiKey(arg, msg.key.participant || msg.key.remoteJid);
+    } catch (err) {
+      return { text: `⚠️ ${err.message}` };
+    }
+
+    // Check it actually works before telling them it's fine.
+    try {
+      const result = await openrouter.chatCompletion({
+        messages: [{ role: "user", content: "reply with just: ok" }],
+        maxTokens: 5,
+      });
+      return {
+        text:
+          `✅ key saved and working (${openrouter.maskKey(openrouter.apiKey())}).\n` +
+          `test reply: ${result.text.slice(0, 60) || "(empty)"}`,
+      };
+    } catch (err) {
+      return {
+        text:
+          `⚠️ key saved (${openrouter.maskKey(openrouter.apiKey())}) but the test call failed: ` +
+          `${err.message.slice(0, 160)}\n` +
+          "check that the key is valid and has credit, then try .cloud hello.",
+      };
+    }
+  }
 
   // Memory housekeeping, handled locally so it always works even if the AI
   // provider is down.

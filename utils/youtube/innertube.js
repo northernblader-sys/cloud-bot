@@ -19,6 +19,7 @@
 //   YT_CLIENTS       comma separated client list to override the order below
 
 const { mkdir, open, rm, stat } = require("fs/promises");
+const session = require("./session");
 const { Readable } = require("stream");
 const { dirname, join } = require("path");
 const { tmpdir } = require("os");
@@ -67,9 +68,22 @@ function envValue(name) {
   return value && value.trim() ? value.trim() : undefined;
 }
 
+// ...but cookies only help the *web* clients. When a session is configured,
+// ask those first instead of walking the whole list.
+const COOKIE_CLIENT_ORDER = [
+  "WEB",
+  "MWEB",
+  "WEB_EMBEDDED_PLAYER",
+  "TVHTML5",
+  "TVHTML5_SIMPLY",
+  "ANDROID_VR",
+  "iOS",
+  "ANDROID_MUSIC",
+];
+
 function clientOrder() {
   const override = envValue("YT_CLIENTS");
-  if (!override) return DEFAULT_CLIENT_ORDER;
+  if (!override) return session.header() ? COOKIE_CLIENT_ORDER : DEFAULT_CLIENT_ORDER;
   const list = override
     .split(",")
     .map((name) => name.trim())
@@ -102,7 +116,8 @@ async function createClient(clientName) {
 
   const poToken = envValue("YT_PO_TOKEN");
   const visitorData = envValue("YT_VISITOR_DATA");
-  const cookie = envValue("YT_COOKIE");
+  // Any of the cookie sources (env, saved from chat) work here.
+  const cookie = session.header();
   if (poToken) options.po_token = poToken;
   if (visitorData) options.visitor_data = visitorData;
   if (cookie) options.cookie = cookie;
@@ -253,6 +268,36 @@ async function downloadStreamUrl(mediaUrl, filePath, { timeoutMs, maxBytes }) {
   }
 }
 
+/**
+ * Turn a format into a downloadable URL, whether or not it is ciphered.
+ * Plain URLs (TV/iOS) need no session player at all.
+ */
+async function resolveMediaUrl(format, client, clientName) {
+  // Plain (unciphered) URLs — TV, iOS and some others — need nothing else.
+  if (typeof format.url === "string" && format.url) return format.url;
+
+  const player = client?.session?.player;
+  if (!player) {
+    throw new Error(
+      `[${clientName}] YouTube sent no player response (the session was ` +
+        `refused or limited), so the audio URL can't be deciphered`
+    );
+  }
+
+  try {
+    return await format.decipher(player);
+  } catch (err) {
+    const message = String(err?.message || err);
+    if (/reading 'as'|Cannot read propert|null/i.test(message)) {
+      throw new Error(
+        `[${clientName}] YouTube's player data was incomplete ` +
+          `(this client is being throttled)`
+      );
+    }
+    throw new Error(`[${clientName}] ${message}`);
+  }
+}
+
 function describePlayability(info) {
   const status = info?.playability_status;
   if (!status) return null;
@@ -286,7 +331,13 @@ async function tryClient(clientName, videoId, filePath, maxBytes) {
 
   // Decipher the media URL for the format we just verified, then pull it in
   // byte ranges. This works for TV/iOS (plain URLs) and WEB (nsig ciphers).
-  const url = await format.decipher(client.session.player);
+  //
+  // `client.session.player` is null whenever YouTube answered with something
+  // other than a player response (a consent page, a bot check, a region block).
+  // Deciphering through it then throws a bare "Cannot read properties of null
+  // (reading 'as')", which tells nobody anything — so say what actually
+  // happened and let the next client try.
+  const url = await resolveMediaUrl(format, client, clientName);
   if (!url) throw new Error("YouTube gave no playable audio URL");
 
   await downloadStreamUrl(url, filePath, {

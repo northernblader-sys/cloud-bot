@@ -14,6 +14,8 @@ const { fetchAudioToFile, cleanupFile, TEMP_DIR } = require("../../utils/youtube
 const { fetchAudioFromApis, isLikelyAudio } = require("../../utils/youtube/audioApis");
 const { fetchAudioWithYtdlp, hasYtdlp } = require("../../utils/youtube/ytdlp");
 const { downloadY2mateAudioToFile } = require("../../utils/y2mate/audio");
+const ytSession = require("../../utils/youtube/session");
+const { isOwnerMessage } = require("../../utils/owner");
 
 // WhatsApp tops out around 16 MB for playable audio; stay a bit under it.
 const WHATSAPP_AUDIO_LIMIT = 15.5 * 1024 * 1024;
@@ -211,7 +213,8 @@ async function downloadAudioSource(videoId, filePath) {
   throw combined;
 }
 
-// One short line per source, each with the most useful reason we have.
+// One short line per source, each with the most useful reason we have, then
+// the one action that actually fixes the common case.
 function describeFailure(error) {
   const stages = error.stages || [];
   if (!stages.length) return String(error.message || "unknown error").slice(0, 300);
@@ -224,14 +227,32 @@ function describeFailure(error) {
     return `• ${entry.stage}: ${detail}`;
   });
 
-  // If YouTube is asking for a logged-in session, point at the knobs.
-  const youtube = stages.find((entry) => entry.stage === "YouTube");
-  const youtubeText = [youtube?.error?.message, ...(youtube?.reasons || [])].filter(Boolean).join(" ");
-  const youtubeBlocked = /LOGIN_REQUIRED|confirm you.{0,3}re not a bot|bot/i.test(youtubeText);
-  if (youtubeBlocked) {
+  const allText = stages
+    .map((entry) => [entry.error?.message, ...(entry.reasons || [])].filter(Boolean).join(" "))
+    .join(" ");
+  const blocked = /confirm you.{0,3}re not a bot|bot check|LOGIN_REQUIRED|sign in to confirm/i.test(
+    allText
+  );
+  if (!blocked) return lines.join("\n");
+
+  const state = ytSession.status();
+  if (!state.configured) {
     lines.push(
-      "\n_YouTube is asking for a logged-in/PO-token session from this IP. " +
-        "Set YT_COOKIE (or YT_PO_TOKEN), or point PIPED_INSTANCES at an instance that works._"
+      "\n_YouTube is refusing this server's IP. It wants a logged-in session, " +
+        "and no client trick gets around that.\n" +
+        "Fix it once: export youtube cookies (browser extension \"Get cookies.txt LOCALLY\"), " +
+        "run `base64 -w0 cookies.txt`, then DM me `.play cookie <that text>`. " +
+        "It is stored with the bot's data, so it survives redeploys._"
+    );
+  } else if (state.signedIn) {
+    lines.push(
+      "\n_Your saved youtube cookies were rejected — most likely expired. " +
+        "Re-export them and send `.play cookie <base64>` again._"
+    );
+  } else {
+    lines.push(
+      "\n_The saved cookies aren't from a signed-in session (no `SID`/`HSID`), so " +
+        "YouTube still blocks. Re-export while logged in, then `.play cookie <base64>`._"
     );
   }
 
@@ -248,8 +269,55 @@ async function recompressUnderLimit(sourcePath, outputPath) {
   return null;
 }
 
+// ── `.play cookie` ─────────────────────────────────────────────────
+// The one thing that actually fixes "every source refused" on a datacenter
+// host is a logged-in YouTube session, and the only sane way to get that to a
+// deployed bot is to send it the cookies. Owner only, DM only: cookies are as
+// good as the account's password to anyone who reads them.
+async function handleCookieCommand(msg, argument) {
+  if (!isOwnerMessage(msg)) return { text: "only the owner can do that." };
+
+  const inGroup = String(msg.key.remoteJid || "").endsWith("@g.us");
+  if (inGroup) {
+    return {
+      text: "dm me that instead, not here — youtube cookies are as good as a login.",
+    };
+  }
+
+  const arg = String(argument || "").trim();
+
+  if (!arg) return { text: ytSession.status().text };
+
+  if (/^(clear|remove|delete|reset)$/i.test(arg)) {
+    const removed = ytSession.clearCookies();
+    return { text: removed ? "🧹 youtube cookies removed." : "there were no saved cookies." };
+  }
+
+  try {
+    const saved = ytSession.setCookies(arg, msg.key.participant || msg.key.remoteJid);
+    return {
+      text:
+        `✅ saved ${saved.count} cookies` +
+        `${saved.signedIn ? " — signed-in session, good to go." : " — but none of them are a `SID`/`HSID`, so this is a visitor export and YouTube will still block you."}\n\n` +
+        "try `.play <song>` now. if it still refuses, the cookies are expired: " +
+        "re-export them and send them again.\n" +
+        "`.play cookie` shows the state, `.play cookie clear` removes them.",
+    };
+  } catch (err) {
+    return {
+      text:
+        `⚠️ ${err.message}\n\n` +
+        "expected either the cookies.txt file's contents or its base64 " +
+        "(`base64 -w0 cookies.txt`).",
+    };
+  }
+}
+
 async function playSong(sock, msg, query) {
   const from = msg.key.remoteJid;
+
+  const cookieCommand = /^cookies?(?:\s+([\s\S]*))?$/i.exec(String(query || "").trim());
+  if (cookieCommand) return handleCookieCommand(msg, cookieCommand[1]);
 
   if (!query || !query.trim()) {
     return { text: "⚠️ Usage: .play <song name or YouTube link>" };
