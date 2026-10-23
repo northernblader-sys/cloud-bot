@@ -139,6 +139,33 @@ fetch function in `utils/downloaders/fetchers.js`.
 
 Replying to a message that contains a supported link also works for `.dl`.
 
+## Welcome verification
+
+When `.welcome` is on and someone joins, the bot asks **one anime question**
+instead of the old "2 + 3 = ?" maths challenge. There are 40 questions
+(Naruto, Demon Slayer, Jujutsu Kaisen, Dragon Ball Super, Death Note, The
+Eminence in Shadow, My Hero Academia, Black Clover, Hunter x Hunter, Pokémon,
+One Piece) in `utils/animeQuiz.js`.
+
+Answers are matched generously, because people type how they type:
+
+- capitals, emoji, punctuation and accents are ignored (`KURAMA!!`, `Nézuko`);
+- `the` / `a` / `of` are ignored and plurals folded, so `straw hat`, `hats`,
+  `Straw Hats`, `STRAWHAT PIRATES` and `mugiwara` all count for "the Straw Hat
+  Pirates";
+- partial answers work (`zoro`, `roronoa`, `kakashi`, `deku`, `leaf`);
+- small typos are forgiven (`kuruma`, `nezuki`, `ryomen sukunaa`);
+- digits read as words, so `9 tails` works.
+
+It stays strict where it matters: a wrong answer never passes, and a question
+never accepts another question's answer (a test enforces that across the whole
+pool). Two wrong guesses get a short nudge, then the person can keep trying
+until the 5-minute timeout.
+
+To change the pool, edit `utils/animeQuiz.js` — each entry is
+`{ id, category, question, answers: [...] }`; add every phrasing you want
+accepted to `answers`.
+
 ## Files
 
 | Command | Description |
