@@ -172,3 +172,17 @@ The bot also starts a tiny HTTP server on `$PORT` (default `3000`):
 
 Point an uptime pinger (UptimeRobot / cron-job.org) at `/health` to keep a
 free web service awake. On Render use Start Command `npm start`.
+
+## MongoDB storage (recommended on Render/other hosts without a disk)
+
+Set these environment variables and the WhatsApp session, group settings,
+trusted users and chess games are stored in MongoDB instead of local files,
+so they survive restarts and redeploys:
+
+| Variable | Description |
+|---|---|
+| `MONGODB_URI` | Connection string, e.g. `mongodb+srv://user:pass@cluster0.xxxxx.mongodb.net/` |
+| `MONGODB_DB` | Optional. Database name (default `astral_cloud`) |
+| `BOT_ID` | Optional. Collection prefix (default `astral`). Use a different value per bot if two bots share one database |
+
+Without `MONGODB_URI` the bot keeps using `auth_info/` and `data/` as before.

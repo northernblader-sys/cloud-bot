@@ -1,25 +1,15 @@
-const fs = require("fs");
-const path = require("path");
-const { DATA_DIR } = require("./dataDir");
-
-const DATA_FILE = path.join(DATA_DIR, "trustedUsers.json");
+const persist = require("./persist");
 
 function bareDigits(jid) {
   return (jid || "").split("@")[0].split(":")[0];
 }
 
 function loadAll() {
-  if (!fs.existsSync(DATA_FILE)) return [];
-  try {
-    return JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
-  } catch {
-    return [];
-  }
+  return persist.get("trustedUsers", []);
 }
 
 function saveAll(list) {
-  fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
-  fs.writeFileSync(DATA_FILE, JSON.stringify(list, null, 2));
+  persist.set("trustedUsers", list);
 }
 
 function isTrusted(jid) {

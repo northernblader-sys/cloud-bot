@@ -1,8 +1,4 @@
-const fs = require("fs");
-const path = require("path");
-const { DATA_DIR } = require("./dataDir");
-
-const DATA_FILE = path.join(DATA_DIR, "groupSettings.json");
+const persist = require("./persist");
 
 const DEFAULT_SETTINGS = {
   antilink: true,
@@ -12,30 +8,17 @@ const DEFAULT_SETTINGS = {
   welcome: false,
 };
 
-function loadAll() {
-  if (!fs.existsSync(DATA_FILE)) return {};
-  try {
-    return JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
-  } catch {
-    return {};
-  }
-}
-
-function saveAll(data) {
-  fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
-  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
-}
+const all = () => persist.get("groupSettings", {});
 
 function getSettings(groupJid) {
-  const all = loadAll();
-  return { ...DEFAULT_SETTINGS, ...(all[groupJid] || {}) };
+  return { ...DEFAULT_SETTINGS, ...(all()[groupJid] || {}) };
 }
 
 function setSetting(groupJid, key, value) {
-  const all = loadAll();
-  all[groupJid] = { ...DEFAULT_SETTINGS, ...(all[groupJid] || {}), [key]: value };
-  saveAll(all);
-  return all[groupJid];
+  const data = all();
+  data[groupJid] = { ...DEFAULT_SETTINGS, ...(data[groupJid] || {}), [key]: value };
+  persist.set("groupSettings", data);
+  return data[groupJid];
 }
 
 module.exports = { getSettings, setSetting, DEFAULT_SETTINGS };

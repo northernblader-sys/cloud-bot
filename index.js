@@ -18,6 +18,9 @@ const { startVerification } = require("./middleware/joinVerification");
 const { getSettings } = require("./utils/groupSettings");
 
 const { AUTH_DIR } = require("./utils/dataDir");
+const mongo = require("./utils/mongo");
+const persist = require("./utils/persist");
+const { useMongoAuthState } = require("./utils/mongoAuthState");
 const { getCachedMetadataOnly, invalidateGroupMetadata } = require("./utils/groupPermissions");
 
 // ── Health endpoint ────────────────────────────────────────────────
@@ -53,7 +56,11 @@ const BOT_NUMBER = "2347017869953";
 let currentSock = null; // only the newest socket is allowed to request pairing codes
 
 async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+  // Session lives in MongoDB when MONGODB_URI is set (survives redeploys on
+  // hosts with no disk), otherwise in the local auth_info/ folder.
+  const { state, saveCreds } = mongo.enabled()
+    ? await useMongoAuthState()
+    : await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
 
   const silentLogger = pino({ level: "silent" });
@@ -198,7 +205,21 @@ async function startBot() {
   return sock;
 }
 
-startBot().catch((err) => {
+// Flush pending writes when the host stops the container (deploys send SIGTERM).
+for (const sig of ["SIGTERM", "SIGINT"]) {
+  process.on(sig, async () => {
+    try {
+      await persist.flush();
+    } finally {
+      process.exit(0);
+    }
+  });
+}
+
+(async () => {
+  await persist.init(); // connects to Mongo (if configured) and loads saved data
+  await startBot();
+})().catch((err) => {
   console.error("Fatal error starting Astral Cloud:", err);
   process.exit(1);
 });

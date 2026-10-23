@@ -1,50 +1,43 @@
-const fs = require("fs");
-const path = require("path");
-const { DATA_DIR } = require("./dataDir");
+const persist = require("./persist");
 
-const DATA_FILE = path.join(DATA_DIR, "chessGames.json");
-
-// In-memory cache, mirrored to disk so games survive restarts.
 const GAMES = new Map(); // chatId -> game
 const PLAYERS = new Map(); // jid -> chatId
 const PENDING = new Map(); // challengerJid -> { target, chat, expiry }
 const DRAW_OFFERS = new Map(); // chatId -> jid who offered the draw
 
-function loadAllFromDisk() {
-  if (!fs.existsSync(DATA_FILE)) return;
-  try {
-    const data = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
-    for (const [chatId, game] of Object.entries(data)) {
-      GAMES.set(chatId, game);
-      PLAYERS.set(game.white, chatId);
-      PLAYERS.set(game.black, chatId);
-    }
-  } catch {
-    // ignore corrupt file, start fresh
+let loaded = false;
+function ensureLoaded() {
+  if (loaded) return;
+  loaded = true;
+  const data = persist.get("chessGames", {});
+  for (const [chatId, game] of Object.entries(data)) {
+    GAMES.set(chatId, game);
+    PLAYERS.set(game.white, chatId);
+    PLAYERS.set(game.black, chatId);
   }
 }
 
-function persist() {
-  fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
+function persistGames() {
   const obj = {};
   for (const [chatId, game] of GAMES.entries()) obj[chatId] = game;
-  fs.writeFileSync(DATA_FILE, JSON.stringify(obj, null, 2));
+  persist.set("chessGames", obj);
 }
 
-loadAllFromDisk();
-
 function getGame(chatId) {
+  ensureLoaded();
   return GAMES.get(chatId) || null;
 }
 
 function saveGame(chatId, game) {
+  ensureLoaded();
   GAMES.set(chatId, game);
   PLAYERS.set(game.white, chatId);
   PLAYERS.set(game.black, chatId);
-  persist();
+  persistGames();
 }
 
 function endGame(chatId) {
+  ensureLoaded();
   const game = GAMES.get(chatId);
   if (game) {
     PLAYERS.delete(game.white);
@@ -52,10 +45,11 @@ function endGame(chatId) {
   }
   GAMES.delete(chatId);
   DRAW_OFFERS.delete(chatId);
-  persist();
+  persistGames();
 }
 
 function isPlayerBusy(jid) {
+  ensureLoaded();
   return PLAYERS.has(jid);
 }
 

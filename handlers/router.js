@@ -127,28 +127,16 @@ async function handleMessage(sock, msg) {
     }
 
     case "diag": {
-      // Temporary diagnostic command — reports where persistent data is
-      // actually being read/written from, and whether it survived a restart.
-      const { BASE_DIR, DATA_DIR, AUTH_DIR } = require("../utils/dataDir");
-      const fsSync = require("fs");
-      const pathMod = require("path");
-      const settingsFile = pathMod.join(DATA_DIR, "groupSettings.json");
+      // Owner-only diagnostic: where is data being stored?
+      if (!isOwnerMessage(msg)) break;
+      const mongoUtil = require("../utils/mongo");
+      const persistUtil = require("../utils/persist");
+      const { BASE_DIR } = require("../utils/dataDir");
+      const settings = persistUtil.get("groupSettings", {});
       const lines = [
-        `📁 BASE_DIR: ${BASE_DIR}`,
-        `📁 DATA_DIR: ${DATA_DIR}`,
-        `📁 AUTH_DIR: ${AUTH_DIR}`,
-        `🔧 DATA_DIR env var: ${process.env.DATA_DIR || "(not set)"}`,
-        `❓ /data exists on disk: ${fsSync.existsSync("/data")}`,
-        `❓ groupSettings.json exists: ${fsSync.existsSync(settingsFile)}`,
+        `💾 Storage: ${mongoUtil.enabled() ? `MongoDB (${mongoUtil.DB_NAME}, prefix ${mongoUtil.BOT_ID}_)` : `local files (${BASE_DIR})`}`,
+        `👥 Groups with saved settings: ${Object.keys(settings).length}`,
       ];
-      if (fsSync.existsSync(settingsFile)) {
-        try {
-          const raw = fsSync.readFileSync(settingsFile, "utf8");
-          lines.push(`📄 groupSettings.json content:\n${raw}`);
-        } catch (err) {
-          lines.push(`⚠️ Failed to read file: ${err.message}`);
-        }
-      }
       await sock.sendMessage(from, { text: lines.join("\n") }, { quoted: msg });
       break;
     }
