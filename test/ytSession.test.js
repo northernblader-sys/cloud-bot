@@ -118,7 +118,7 @@ test("cookies: cookies for other sites are dropped, not stored or sent", () => {
     assert.match(header, /YT_SID/);
 
     const file = readFileSync(session.cookieFile(), "utf8");
-    for (const leaked of [/railway/i, /rw\.session/, /stripe/i, /hcaptcha/i, /RAILWAY/, /STRIPE/]) {
+    for (const leaked of [/railway/i, /rw\.session/, /stripe/i, /hcaptcha/i, /ai\.google\.dev/i, /AI_STUDIO/, /django_language/]) {
       assert.doesNotMatch(file, leaked, `the cookie file must not contain ${leaked}`);
       assert.doesNotMatch(header, leaked, `the header must not contain ${leaked}`);
     }

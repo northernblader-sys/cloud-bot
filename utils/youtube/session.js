@@ -46,7 +46,7 @@ const FALLBACK_FILE = path.join(DATA_DIR, "yt-cookies.txt");
 // anything outside these domains is dropped on the way in: it never reaches
 // MongoDB, the cookie file, or a request header.
 const RELEVANT_DOMAIN =
-  /(^|\.)(youtube\.com|youtube-nocookie\.com|googlevideo\.com|google\.com|google\.[a-z]{2,3}(\.[a-z]{2})?|google\.com\.[a-z]{2}|accounts\.google\.com|ogs\.google\.com)$/i;
+  /(^|\.)(youtube\.com|youtube-nocookie\.com|googlevideo\.com|google\.com|google\.com\.[a-z]{2}|google\.co\.[a-z]{2}|accounts\.google\.com|ogs\.google\.com)$/i;
 
 const AUTH_COOKIES = [
   "SID",
