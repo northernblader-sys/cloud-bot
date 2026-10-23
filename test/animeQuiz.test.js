@@ -238,8 +238,8 @@ test("verification: any close-enough answer passes and moves to the profile step
   const entry = flow.store.getPending(GROUP, MEMBER);
   const question = quiz.getQuestion(entry.questionId);
 
-  // Answer the way a person would: one word from the accepted variants.
-  const shortAnswer = question.answers[0].split(" ")[0].toUpperCase();
+  // Answer in a form the pool guarantees: a listed variant, shouted.
+  const shortAnswer = question.answers[0].toUpperCase();
 
   const consumed = await flow.checkVerificationReply(
     flow.sock,

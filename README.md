@@ -44,11 +44,19 @@ commands, or answers it conversationally.
 
 - **Model:** OpenRouter (`utils/openrouter.js`), `openai/gpt-4o-mini` by
   default — cheap, fast, handles tool calling and images. Set
-  `OPENROUTER_MODEL` to switch (e.g. `openai/gpt-4o`). The key is read from
-  `OPENROUTER_API_KEY`, or from `<DATA_DIR>/openrouter.key` (one line,
-  gitignored) — see `utils/openrouter.key.example`. It is deliberately not
-  committed: GitHub's push protection rejects live credentials in a public
-  repo, and anyone who could read the file could spend against it.
+  `OPENROUTER_MODEL` to switch (e.g. `openai/gpt-4o`). The key is read from,
+  in order: `OPENROUTER_API_KEY`, a key saved at runtime, or
+  `<DATA_DIR>/openrouter.key` (see `utils/openrouter.key.example`). It is
+  deliberately not committed: GitHub's push protection rejects live
+  credentials in a public repo, and anyone who could read the file could spend
+  against it.
+
+  Quickest way to set it: **DM the bot** `.cloud key sk-or-v1-...` as the
+  owner. It is stored through `utils/persist.js` (MongoDB when
+  `MONGODB_URI` is set, otherwise the local data dir), validated, and tested
+  with a real call before it confirms. `.cloud key` shows the masked key and
+  where it came from; `.cloud key clear` removes it. Keys are refused in group
+  chats so they never end up in chat history.
 - **Personality:** `utils/cloudPersonality.js` — identity, tone rules, voice
   examples and reply clean-up (no em dashes, no markdown). Edit this file to
   change how cloud talks; nothing else needs touching.
