@@ -707,3 +707,116 @@ test("play: prefers yt-dlp, then InnerTube, then APIs, then y2mate", async () =>
   assert.ok(Buffer.isBuffer(result.audio));
   assert.deepEqual(calls, ["ytdlp"], "the first working source wins");
 });
+
+// ── Arroxy ladder (second yt-dlp pass) ─────────────────────────────
+
+test("arroxy: ladder order is po-token -> non-PoT clients -> yt-dlp defaults", () => {
+  const ytdlp = require(path.join(ROOT, "utils", "youtube", "ytdlp.js"));
+
+  const without = ytdlp.arroxyLadder({ url: "u", template: "t", poToken: null, visitorData: null });
+  assert.deepEqual(without.map((entry) => entry.label), ["no-pot-clients", "no-extractor-args"]);
+  // VidBee's trick: the clients that *demand* a PO token are removed.
+  const fallbackArgs = without[0].args.join(" ");
+  assert.match(fallbackArgs, /player_client=default,-web,-web_safari/);
+
+  const withToken = ytdlp.arroxyLadder({
+    url: "u",
+    template: "t",
+    poToken: "TOKEN123",
+    visitorData: "VD456",
+  });
+  assert.deepEqual(withToken.map((entry) => entry.label), ["po-token", "no-pot-clients", "no-extractor-args"]);
+
+  const potArgs = withToken[0].args.join(" ");
+  // One --extractor-args block per extractor, carrying token + visitor data.
+  assert.equal((potArgs.match(/--extractor-args/g) || []).length, 1);
+  assert.match(potArgs, /po_token=web\.gvs\+TOKEN123/);
+  assert.match(potArgs, /visitor_data=VD456/);
+
+  // A token without visitor data is useless to yt-dlp, so no PoT attempt.
+  const tokenOnly = ytdlp.arroxyLadder({ url: "u", template: "t", poToken: "TOKEN123", visitorData: null });
+  assert.deepEqual(tokenOnly.map((entry) => entry.label), ["no-pot-clients", "no-extractor-args"]);
+
+  // Hardening flags from Arroxy's download path.
+  for (const flag of ["--ignore-config", "--http-chunk-size", "--abort-on-unavailable-fragments", "--no-js-runtimes"]) {
+    assert.ok(fallbackArgs.includes(flag), `expected ${flag}`);
+  }
+  assert.ok(fallbackArgs.includes(`node:${process.execPath}`), "passes the bot's own node runtime");
+});
+
+test("arroxy: classifies yt-dlp failures into actionable kinds", () => {
+  const { classifyYtdlpError } = require(path.join(ROOT, "utils", "youtube", "ytdlp.js"));
+
+  assert.equal(classifyYtdlpError("ERROR: [youtube] x: Sign in to confirm you're not a bot").kind, "botBlock");
+  assert.equal(classifyYtdlpError("ERROR: HTTP Error 429: Too Many Requests").kind, "rateLimit");
+  assert.equal(classifyYtdlpError("ERROR: [youtube] x: Video unavailable").kind, "unavailable");
+  assert.equal(classifyYtdlpError("ERROR: [youtube] x: This video is age-restricted").kind, "ageRestricted");
+  assert.equal(classifyYtdlpError("ERROR: ffmpeg not found. Please install").kind, "missingDependency");
+  assert.equal(classifyYtdlpError("something else broke").kind, "other");
+
+  const blocked = classifyYtdlpError("Sign in to confirm you're not a bot");
+  assert.equal(blocked.retryable, true);
+  assert.match(blocked.fix, /YT_COOKIE|PIPED/);
+});
+
+test("arroxy: a rate limit ends the ladder instead of burning more requests", async () => {
+  const ytdlp = require(path.join(ROOT, "utils", "youtube", "ytdlp.js"));
+  // Fake binary: always reports a 429 and records each invocation.
+  const log = path.join(await mkdtemp(path.join(os.tmpdir(), "ytdlp-log-")), "calls.log");
+  const bin = await writeFakeYtdlp(`
+echo "call" >> "${log}"
+echo "ERROR: HTTP Error 429: Too Many Requests" >&2
+exit 1
+`);
+  process.env.YTDLP_PATH = bin;
+  ytdlp._reset();
+
+  try {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "ytdlp-out-"));
+    await assert.rejects(
+      ytdlp.fetchAudioWithYtdlp("video-id", path.join(dir, "a.bin"), { strategy: "arroxy" }),
+      (err) => {
+        assert.equal(err.kind, "rateLimit");
+        return true;
+      }
+    );
+    const calls = readFileSync(log, "utf8").trim().split("\n").filter(Boolean);
+    assert.equal(calls.length, 1, "the ladder must stop at the first rate limit");
+  } finally {
+    delete process.env.YTDLP_PATH;
+    ytdlp._reset();
+  }
+});
+
+test("play: tries both yt-dlp passes before other sources", async () => {
+  const calls = [];
+  const playSong = withPlayDependencies({
+    ytdlp: {
+      hasYtdlp: () => true,
+      fetchAudioWithYtdlp: async (id, file, options = {}) => {
+        calls.push(options.strategy);
+        if (options.strategy === "basic") {
+          const error = new Error("ERROR: Sign in to confirm you're not a bot");
+          error.kind = "botBlock";
+          throw error;
+        }
+        writeFileSync(file, Buffer.concat([Buffer.from("ID3"), Buffer.alloc(2048, 1)]));
+        return { source: "yt-dlp (arroxy ladder)", mimeType: "audio/mpeg", title: "T", durationSec: 180 };
+      },
+    },
+    innertube: {
+      ...idleCleanup,
+      fetchAudioToFile: async () => {
+        calls.push("innertube");
+        throw new Error("should not be reached");
+      },
+    },
+    y2mate: async () => {
+      throw new Error("should not be reached");
+    },
+  });
+
+  const result = await playSong(fakeSock(), { key: { remoteJid: "1@g.us" } }, "song");
+  assert.ok(Buffer.isBuffer(result.audio));
+  assert.deepEqual(calls, ["basic", "arroxy"]);
+});

@@ -146,12 +146,34 @@ async function downloadAudioSource(videoId, filePath) {
   // changes (PO tokens, nsig challenges) faster than any library can, and it
   // is the approach proven by desktop downloaders. Autodownloading it is
   // handled inside (YTDLP_AUTODOWNLOAD=0 disables the ~30 MB fetch).
+  //
+  // Two yt-dlp passes: the plain desktop-app recipe, then Arroxy's retry
+  // ladder (PO token if configured → clients that don't demand one → yt-dlp's
+  // own defaults), which is what rescues videos the first pass can't reach.
   if (hasYtdlp() || process.env.YTDLP_AUTODOWNLOAD !== "0") {
-    try {
-      return await fetchAudioWithYtdlp(videoId, filePath, { maxBytes: MAX_SOURCE_BYTES });
-    } catch (error) {
-      stages.push({ stage: "yt-dlp", error, reasons: reasonsOf(error) });
-      console.warn(`[play] yt-dlp failed, trying InnerTube: ${error.message}`);
+    const strategies = [
+      { strategy: "basic", label: "yt-dlp" },
+      { strategy: "arroxy", label: "yt-dlp (arroxy)" },
+    ];
+
+    for (const { strategy, label } of strategies) {
+      try {
+        return await fetchAudioWithYtdlp(videoId, filePath, {
+          maxBytes: MAX_SOURCE_BYTES,
+          strategy,
+        });
+      } catch (error) {
+        stages.push({ stage: label, error, reasons: reasonsOf(error) });
+        console.warn(`[play] ${label} failed: ${error.message}`);
+        // A rate limit or a removed video won't be fixed by another source.
+        if (error.kind === "rateLimit") {
+          const error2 = new Error(error.message);
+          error2.kind = error.kind;
+          error2.stages = stages;
+          error2.code = "DOWNLOAD_FAILED";
+          throw error2;
+        }
+      }
     }
   }
 

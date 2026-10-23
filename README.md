@@ -54,12 +54,19 @@ source that actually produced audio bytes:
 0. **yt-dlp** (`utils/youtube/ytdlp.js`) — the approach desktop downloaders
    use, and the most reliable of the lot: yt-dlp follows YouTube's anti-bot
    changes (PO tokens, nsig/sig challenges, new player clients) within days.
-   It runs with a JS runtime (`--js-runtimes node:<this bot's node>`) so it can
-   solve the player challenges, plus
-   `youtube:player_client=default,web_safari`. The binary comes from
-   `YTDLP_PATH`, `<DATA_DIR>/media/bin/`, `yt-dlp` on `PATH`, or is downloaded
-   once from the official GitHub release (`YTDLP_AUTODOWNLOAD=0` disables
-   that).
+   Two passes over the same binary:
+   - `basic` — the Refloow recipe: `-f bestaudio`, `--js-runtimes
+     node:<this bot's node>`, `youtube:player_client=default,web_safari`.
+   - `arroxy` — [Arroxy](https://github.com/antonio-orionus/Arroxy)'s retry
+     ladder: PO token + visitor data (when `YT_PO_TOKEN` is set) →
+     `player_client=default,-web,-web_safari` (VidBee's trick: drop the
+     clients that *demand* a token) → yt-dlp's own clients, with
+     `--ignore-config`, chunked HTTP, bounded retries and a stop at the first
+     rate limit instead of hammering YouTube.
+
+   The binary comes from `YTDLP_PATH`, `<DATA_DIR>/media/bin/`, `yt-dlp` on
+   `PATH`, or is downloaded once from the official GitHub release
+   (`YTDLP_AUTODOWNLOAD=0` disables that).
 1. **YouTube InnerTube** (`utils/youtube/innertube.js`) — several clients are
    tried (TV first, since it still serves audio without a PO token) and the
    first that returns real bytes wins. Highest quality, one request.
