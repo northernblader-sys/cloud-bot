@@ -63,4 +63,9 @@ async function useMongoAuthState() {
   };
 }
 
-module.exports = { useMongoAuthState };
+// Deletes the whole saved session (used to recover from a stale/half pairing).
+async function clearAuth() {
+  await mongo.getCollection("auth").deleteMany({});
+}
+
+module.exports = { useMongoAuthState, clearAuth };

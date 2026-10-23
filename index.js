@@ -20,7 +20,7 @@ const { getSettings } = require("./utils/groupSettings");
 const { AUTH_DIR } = require("./utils/dataDir");
 const mongo = require("./utils/mongo");
 const persist = require("./utils/persist");
-const { useMongoAuthState } = require("./utils/mongoAuthState");
+const { loadAuth } = require("./utils/authLoader");
 const { getCachedMetadataOnly, invalidateGroupMetadata } = require("./utils/groupPermissions");
 
 // ── Health endpoint ────────────────────────────────────────────────
@@ -58,10 +58,9 @@ let currentSock = null; // only the newest socket is allowed to request pairing 
 
 async function startBot() {
   // Session lives in MongoDB when MONGODB_URI is set (survives redeploys on
-  // hosts with no disk), otherwise in the local auth_info/ folder.
-  const { state, saveCreds } = mongo.enabled()
-    ? await useMongoAuthState()
-    : await useMultiFileAuthState(AUTH_DIR);
+  // hosts with no disk), otherwise in the local auth_info/ folder. Stale or
+  // half-finished sessions are cleared automatically.
+  const { state, saveCreds } = await loadAuth(BOT_NUMBER);
   const { version } = await fetchLatestBaileysVersion();
 
   const silentLogger = pino({ level: "silent" });
