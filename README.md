@@ -168,7 +168,10 @@ DM the bot (owner only, never in a group):
 .play cookie <paste that text>
 ```
 
-It is validated (a visitor-only export with no `SID`/`HSID` is rejected with an
+Only **Google/YouTube cookies** are kept: a browser export also contains
+whatever else that browser is signed in to (dashboards, payment, captcha), and
+none of that is stored, written to the cookie file, or sent anywhere. It is
+validated (a visitor-only export with no `SID`/`HSID` is rejected with an
 explanation), stored through `utils/persist.js` — so in MongoDB when
 `MONGODB_URI` is set, surviving redeploys — and written to a `cookies.txt` that
 yt-dlp is given via `--cookies` and InnerTube via its session. Cookie values are

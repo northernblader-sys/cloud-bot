@@ -90,6 +90,43 @@ test("cookies: a plain Cookie header is converted with the right domains", () =>
   });
 });
 
+test("cookies: cookies for other sites are dropped, not stored or sent", () => {
+  // A real browser export carries every site the browser has: dashboards,
+  // payment, captcha. Only Google/YouTube cookies may reach storage, the
+  // cookie file or a request header.
+  withoutEnv(() => {
+    session.clearCookies();
+    session._reset();
+
+    const mixed = [
+      "# Netscape HTTP Cookie File",
+      ".youtube.com\tTRUE\t/\tTRUE\t1827267450\tSID\tYT_SID",
+      ".youtube.com\tTRUE\t/\tTRUE\t1827267450\tLOGIN_INFO\tLOGIN_INFO",
+      ".google.com\tTRUE\t/\tTRUE\t1827267450\t__Secure-3PSID\tGOOGLE_SID",
+      ".google.com.ng\tTRUE\t/\tTRUE\t1827267452\tHSID\tNG_HSID",
+      ".railway.com\tTRUE\t/\tTRUE\t1824332173\trw.session\tRAILWAY_SESSION",
+      "backboard.railway.com\tFALSE\t/\tTRUE\t1795300804\trw.session.sig\tRAILWAY_SIG",
+      "m.stripe.com\tFALSE\t/\tTRUE\t1827356937\tm\tSTRIPE_ID",
+      "api.hcaptcha.com\tFALSE\t/\tTRUE\t1795375273\thmt_id\tHCAPTCHA_ID",
+    ].join("\n");
+
+    const saved = session.setCookies(mixed);
+    assert.equal(saved.count, 4, "only the google/youtube cookies are kept");
+    assert.deepEqual(saved.names.sort(), ["HSID", "LOGIN_INFO", "SID", "__Secure-3PSID"]);
+
+    const header = session.header();
+    assert.match(header, /YT_SID/);
+
+    const file = readFileSync(session.cookieFile(), "utf8");
+    for (const leaked of [/railway/i, /rw\.session/, /stripe/i, /hcaptcha/i, /RAILWAY/, /STRIPE/]) {
+      assert.doesNotMatch(file, leaked, `the cookie file must not contain ${leaked}`);
+      assert.doesNotMatch(header, leaked, `the header must not contain ${leaked}`);
+    }
+    // Country domains are still Google, so they survive.
+    assert.match(file, /google\.com\.ng/);
+  });
+});
+
 test("cookies: base64 is accepted, because a chat paste has no tabs", () => {
   withoutEnv(() => {
     session.clearCookies();

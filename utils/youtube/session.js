@@ -41,6 +41,13 @@ const FALLBACK_FILE = path.join(DATA_DIR, "yt-cookies.txt");
 // Cookies that only exist on a signed-in session. If none of these are
 // present the export is useless for bot checks (a visitor-only export is the
 // usual mistake).
+// A browser export contains EVERY site's cookies — Railway dashboards, Stripe,
+// hCaptcha, whatever else was open. The bot needs YouTube and nothing else, so
+// anything outside these domains is dropped on the way in: it never reaches
+// MongoDB, the cookie file, or a request header.
+const RELEVANT_DOMAIN =
+  /(^|\.)(youtube\.com|youtube-nocookie\.com|googlevideo\.com|google\.com|google\.[a-z]{2,3}(\.[a-z]{2})?|google\.com\.[a-z]{2}|accounts\.google\.com|ogs\.google\.com)$/i;
+
 const AUTH_COOKIES = [
   "SID",
   "HSID",
@@ -137,7 +144,12 @@ function normalise(raw) {
   if (!text) return null;
 
   const isNetscape = /\t/.test(text) && /^\s*(#|\.?[a-z0-9.-]+\t)/im.test(text);
-  const cookies = isNetscape ? parseNetscape(text) : parseCookieHeader(text);
+  const parsed = isNetscape ? parseNetscape(text) : parseCookieHeader(text);
+  // Keep Google/YouTube cookies only. A header has no domains, so it is used
+  // as given (the user chose what to send); a file export is filtered.
+  const cookies = isNetscape
+    ? parsed.filter((cookie) => RELEVANT_DOMAIN.test(String(cookie.domain || "").replace(/^#HttpOnly_/, "")))
+    : parsed;
   const usable = cookies.filter((cookie) => cookie.name && cookie.value);
   if (!usable.length) return null;
   if (!usable.some((cookie) => KNOWN_COOKIE.test(cookie.name))) return null;
@@ -146,12 +158,15 @@ function normalise(raw) {
 
   let netscape;
   if (isNetscape) {
-    // Keep the caller's own domains/expiry, just guarantee a header line.
-    const body = text
-      .split(/\r?\n/)
-      .filter((line) => line && !line.startsWith("#"))
-      .join("\n");
-    netscape = `${NETSCAPE_HEADER}${body}\n`;
+    // Rebuild from the filtered cookies (keeping their own domains/expiry) so
+    // no unrelated site's cookie survives into the file.
+    const lines = usable.map((cookie) => {
+      const line = text
+        .split(/\r?\n/)
+        .find((entry) => !entry.startsWith("#") && entry.split("\t")[5] === cookie.name);
+      return line ? line.trim() : null;
+    });
+    netscape = `${NETSCAPE_HEADER}${lines.filter(Boolean).join("\n")}\n`;
   } else {
     const expiry = Math.floor(Date.now() / 1000) + 365 * 24 * 60 * 60;
     const lines = usable.map(({ name, value }) => {
