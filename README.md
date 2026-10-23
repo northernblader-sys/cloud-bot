@@ -37,6 +37,33 @@ pm2 save
 | `.tenor <query>[, count]` | Search Tenor and send back animated stickers |
 | `.about` | About Astral Cloud |
 
+## The `.cloud` brain
+
+`.cloud <anything>` routes a natural-language message to one of the bot's
+commands, or answers it conversationally.
+
+- **Model:** OpenRouter (`utils/openrouter.js`), `openai/gpt-4o-mini` by
+  default — cheap, fast, handles tool calling and images. Set
+  `OPENROUTER_MODEL` to switch (e.g. `openai/gpt-4o`). The key is read from
+  `OPENROUTER_API_KEY`, or from `<DATA_DIR>/openrouter.key` (one line,
+  gitignored) — see `utils/openrouter.key.example`. It is deliberately not
+  committed: GitHub's push protection rejects live credentials in a public
+  repo, and anyone who could read the file could spend against it.
+- **Personality:** `utils/cloudPersonality.js` — identity, tone rules, voice
+  examples and reply clean-up (no em dashes, no markdown). Edit this file to
+  change how cloud talks; nothing else needs touching.
+- **Memory:** `utils/cloudMemory.js` — remembers each member by phone number
+  and name, plus a running transcript **per person per chat**, so two people in
+  the same group never share a conversation. Names/facts are learned from the
+  model's `<remember .../>` tags (stripped before sending) with a regex backup
+  for "my name is …" / "call me …". Stored through `utils/persist.js`, so it
+  survives restarts (MongoDB when `MONGODB_URI` is set, JSON files otherwise).
+- **Grounding:** answers use OpenRouter's web plugin for live info.
+- **Housekeeping:** `.cloud whoami` shows what the bot remembers about you,
+  `.cloud forget me` wipes your name, facts and transcripts.
+- If OpenRouter is unreachable **and** `GEMINI_API_KEY` is set, it falls back
+  to the old Gemini path so `.cloud` still answers.
+
 ## Downloaders
 
 | Command | Description |
@@ -48,14 +75,39 @@ pm2 save
 | `.fb <url>` | Download a Facebook video/photo |
 | `.dl <url>` | Auto-detect the platform and download |
 
-`.play` searches YouTube (youtubei.js), then downloads the audio-only stream
-straight from YouTube's InnerTube API (`utils/youtube/innertube.js`). Several
-InnerTube clients are tried in order — TV first, since it still serves audio
-without a PO token — and the first one that returns real bytes wins; the
-download is streamed in byte ranges to a temp file, converted to MP3 with
-ffmpeg, and sent back as a WhatsApp audio message (with the cover art as a
-thumbnail). If every YouTube client refuses, it falls back to the y2mate
-scraper in `utils/y2mate/audio.js`.
+`.play` fetches audio from several sources, in order, and only accepts a
+source that actually produced audio bytes:
+
+0. **yt-dlp** (`utils/youtube/ytdlp.js`) — the approach desktop downloaders
+   use, and the most reliable of the lot: yt-dlp follows YouTube's anti-bot
+   changes (PO tokens, nsig/sig challenges, new player clients) within days.
+   Two passes over the same binary:
+   - `basic` — the Refloow recipe: `-f bestaudio`, `--js-runtimes
+     node:<this bot's node>`, `youtube:player_client=default,web_safari`.
+   - `arroxy` — [Arroxy](https://github.com/antonio-orionus/Arroxy)'s retry
+     ladder: PO token + visitor data (when `YT_PO_TOKEN` is set) →
+     `player_client=default,-web,-web_safari` (VidBee's trick: drop the
+     clients that *demand* a token) → yt-dlp's own clients, with
+     `--ignore-config`, chunked HTTP, bounded retries and a stop at the first
+     rate limit instead of hammering YouTube.
+
+   The binary comes from `YTDLP_PATH`, `<DATA_DIR>/media/bin/`, `yt-dlp` on
+   `PATH`, or is downloaded once from the official GitHub release
+   (`YTDLP_AUTODOWNLOAD=0` disables that).
+1. **YouTube InnerTube** (`utils/youtube/innertube.js`) — several clients are
+   tried (TV first, since it still serves audio without a PO token) and the
+   first that returns real bytes wins. Highest quality, one request.
+2. **Public YouTube APIs** (`utils/youtube/audioApis.js`) — Piped, Invidious,
+   cobalt, or your own endpoint, so a blocked server IP still gets audio from
+   someone else's. Every response is magic-number checked, so an HTML "rate
+   limited" page is never sent as a voice note.
+3. **y2mate** (`utils/y2mate/audio.js`) — HTML scraper, last resort.
+
+The winning source is streamed in verified byte ranges to a temp file,
+converted to MP3 with ffmpeg, and sent as a WhatsApp audio message (with the
+cover art as a thumbnail). If every source refuses, the reply lists one
+line per source with its real error, and — when YouTube is the blocker — points
+at the env var that fixes it.
 
 Notes:
 
@@ -67,6 +119,18 @@ Notes:
   bot"). Optional env vars help there: `YT_PO_TOKEN` (Proof-of-Origin token),
   `YT_VISITOR_DATA`, `YT_COOKIE`, and `YT_CLIENTS` (comma-separated client
   order override, e.g. `TVHTML5,iOS,WEB`).
+- yt-dlp knobs: `YTDLP_PATH` (use a specific binary), `YTDLP_AUTODOWNLOAD=0`
+  (never fetch it automatically), `YT_EXTRACTOR_ARGS` is not needed — the
+  working default is baked in. The binary is stored in `<DATA_DIR>/media/bin/`
+  so it survives restarts on hosts with a persistent volume.
+- Tune the fallback APIs with:
+  - `YT_AUDIO_APIS` — order/list of providers, e.g. `piped,cobalt`, or a bare
+    template URL `https://api.example/dl?id={id}` whose JSON/text response
+    contains the media link.
+  - `PIPED_INSTANCES`, `INVIDIOUS_INSTANCES`, `COBALT_INSTANCES`
+    (or `COBALT_API_URL`) — comma-separated base URLs to use instead of the
+    built-in public ones. Self-hosted instances are the most reliable fix if
+    public ones are slow or down.
 
 `.tiktok`/`.ig`/`.pinterest`/`.fb` use tikwm.com and api-faa.my.id. Those are
 third-party scraper APIs, not official platform APIs — they can change or go
@@ -74,6 +138,33 @@ down without notice. If one stops working, the fix is updating the relevant
 fetch function in `utils/downloaders/fetchers.js`.
 
 Replying to a message that contains a supported link also works for `.dl`.
+
+## Welcome verification
+
+When `.welcome` is on and someone joins, the bot asks **one anime question**
+instead of the old "2 + 3 = ?" maths challenge. There are 40 questions
+(Naruto, Demon Slayer, Jujutsu Kaisen, Dragon Ball Super, Death Note, The
+Eminence in Shadow, My Hero Academia, Black Clover, Hunter x Hunter, Pokémon,
+One Piece) in `utils/animeQuiz.js`.
+
+Answers are matched generously, because people type how they type:
+
+- capitals, emoji, punctuation and accents are ignored (`KURAMA!!`, `Nézuko`);
+- `the` / `a` / `of` are ignored and plurals folded, so `straw hat`, `hats`,
+  `Straw Hats`, `STRAWHAT PIRATES` and `mugiwara` all count for "the Straw Hat
+  Pirates";
+- partial answers work (`zoro`, `roronoa`, `kakashi`, `deku`, `leaf`);
+- small typos are forgiven (`kuruma`, `nezuki`, `ryomen sukunaa`);
+- digits read as words, so `9 tails` works.
+
+It stays strict where it matters: a wrong answer never passes, and a question
+never accepts another question's answer (a test enforces that across the whole
+pool). Two wrong guesses get a short nudge, then the person can keep trying
+until the 5-minute timeout.
+
+To change the pool, edit `utils/animeQuiz.js` — each entry is
+`{ id, category, question, answers: [...] }`; add every phrasing you want
+accepted to `answers`.
 
 ## Files
 

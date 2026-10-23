@@ -8,15 +8,13 @@ const {
   intersects,
 } = require("../utils/groupPermissions");
 const { addPending, getPending, removePending } = require("../utils/verificationStore");
+const animeQuiz = require("../utils/animeQuiz");
 
 const VERIFY_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function randomMathQuestion() {
-  const a = Math.floor(Math.random() * 8) + 1; // 1-8
-  const b = Math.floor(Math.random() * 8) + 1; // 1-8
-  return { a, b, answer: a + b };
-}
+// How many wrong guesses before we stop nudging (they can still keep trying).
+const MAX_NUDGES = 2;
 
 function bareDigits(jid) {
   return (jid || "").split("@")[0].split(":")[0];
@@ -63,11 +61,14 @@ async function startVerification(sock, groupJid, participant) {
   const botAdmin = metadata ? isParticipantAdmin(metadata, [...botAliases(sock)]) : false;
 
   const taggableJid = await resolveTaggableJid(sock, groupJid, p);
-  const { a, b, answer } = randomMathQuestion();
+  // Instead of "2 + 3 = ?" the new member has to answer one anime question,
+  // picked at random from 40. Answers are fuzzy-matched, so any recognisable
+  // form of the right answer counts (see utils/animeQuiz.js).
+  const question = animeQuiz.pickQuestion();
 
   const timeout = setTimeout(async () => {
     const entry = getPending(groupJid, p);
-    if (!entry || entry.stage !== "math") return; // already verified or cleared
+    if (!entry || entry.stage !== "quiz") return; // already verified or cleared
     removePending(groupJid, p);
 
     try {
@@ -88,7 +89,7 @@ async function startVerification(sock, groupJid, participant) {
     }
   }, VERIFY_TIMEOUT_MS);
 
-  addPending(groupJid, p, { answer, stage: "math", timeout });
+  addPending(groupJid, p, { stage: "quiz", attempts: 0, ...animeQuiz.questionPayload(question), timeout });
 
   // Tiny delay so the join notification lands before our message.
   await sleep(1200);
@@ -96,8 +97,9 @@ async function startVerification(sock, groupJid, participant) {
   await sock.sendMessage(groupJid, {
     text:
       `👋 Welcome ${mention(taggableJid)}!\n\n` +
-      `To make sure you're human, please solve: *${a} + ${b} = ?*\n` +
-      `Just reply with the number. You have 5 minutes.`,
+      `Answer this to get in — *${question.question}*\n` +
+      `_(${question.category})_\n\n` +
+      `Any answer that's close enough will do. You have 5 minutes.`,
     mentions: [taggableJid],
   });
 }
@@ -118,17 +120,21 @@ async function checkVerificationReply(sock, msg, text) {
   const sender = { id: msg.key.participant, phoneNumber: msg.key.participantAlt };
   const taggableJid = await resolveTaggableJid(sock, groupJid, sender);
 
-  if (entry.stage === "math") {
-    const num = Number((text || "").trim().match(/-?\d+/)?.[0]);
+  if (entry.stage === "quiz") {
+    const question = animeQuiz.getQuestion(entry.questionId);
 
-    if (!Number.isNaN(num) && num === entry.answer) {
+    // A question that vanished from the list (renamed id) must never trap
+    // someone: accept and move on rather than kicking a real person.
+    const correct = question ? animeQuiz.isCorrect(question, text) : true;
+
+    if (correct) {
       clearTimeout(entry.timeout);
       entry.timeout = null;
       entry.stage = "profile"; // keep entry, no further kick risk
 
       await sock.sendMessage(groupJid, {
         text:
-          `✅ ${mention(taggableJid)} verified, welcome aboard!\n\n` +
+          `✅ ${mention(taggableJid)} got it${entry.attempts ? " in the end" : ""}, welcome aboard!\n\n` +
           `While you're here, tell us a bit about yourself:\n` +
           `• Your name\n` +
           `• Your age\n` +
@@ -140,8 +146,15 @@ async function checkVerificationReply(sock, msg, text) {
       return true;
     }
 
-    // wrong answer — ignore and let them keep trying until the timeout fires
-    return false;
+    // Wrong answer: nudge twice, then stay quiet and let the timeout decide.
+    entry.attempts = (entry.attempts || 0) + 1;
+    if (entry.attempts <= MAX_NUDGES) {
+      await sock.sendMessage(groupJid, {
+        text: `❌ not quite ${mention(taggableJid)}, try again. you still have time.`,
+        mentions: [taggableJid],
+      });
+    }
+    return true; // consumed, so it isn't also parsed as a command
   }
 
   if (entry.stage === "profile") {
