@@ -121,15 +121,24 @@ function parseCookieHeader(text) {
   return out;
 }
 
-/** A cookies.txt -> [{name, value, domain}]. Ignores comments and blanks. */
+function isCommentLine(line) {
+  return line.startsWith("#") && !/^#HttpOnly_/i.test(line);
+}
+
+/** A cookies.txt -> [{name, value, domain, line}]. Ignores comments and blanks, keeps #HttpOnly_. */
 function parseNetscape(text) {
   const out = [];
-  for (const line of String(text || "").split(/\r?\n/)) {
-    const value = line.trim();
-    if (!value || value.startsWith("#")) continue;
-    const fields = line.split("\t");
+  for (const rawLine of String(text || "").split(/\r?\n/)) {
+    const value = rawLine.trim();
+    if (!value || isCommentLine(value)) continue;
+    const fields = value.split("\t");
     if (fields.length < 7) continue;
-    out.push({ domain: fields[0], name: fields[5], value: fields[6] });
+    out.push({
+      domain: fields[0],
+      name: fields[5],
+      value: fields[6],
+      line: fields.slice(0, 7).join("\t"),
+    });
   }
   return out;
 }
@@ -148,25 +157,42 @@ function normalise(raw) {
   // Keep Google/YouTube cookies only. A header has no domains, so it is used
   // as given (the user chose what to send); a file export is filtered.
   const cookies = isNetscape
-    ? parsed.filter((cookie) => RELEVANT_DOMAIN.test(String(cookie.domain || "").replace(/^#HttpOnly_/, "")))
+    ? parsed.filter((cookie) =>
+        RELEVANT_DOMAIN.test(String(cookie.domain || "").replace(/^#HttpOnly_/i, ""))
+      )
     : parsed;
-  const usable = cookies.filter((cookie) => cookie.name && cookie.value);
-  if (!usable.length) return null;
-  if (!usable.some((cookie) => KNOWN_COOKIE.test(cookie.name))) return null;
+  const rawUsable = cookies.filter((cookie) => cookie.name && cookie.value);
+  if (!rawUsable.length) return null;
+  if (!rawUsable.some((cookie) => KNOWN_COOKIE.test(cookie.name))) return null;
 
-  const header = usable.map((cookie) => `${cookie.name}=${cookie.value}`).join("; ");
+  // Deduplicate identical (domain, name) entries (browser exports often list
+  // the same cookie twice across partitions; keep the later entry).
+  const dedupMap = new Map();
+  for (const cookie of rawUsable) {
+    const cleanDom = String(cookie.domain || "").replace(/^#HttpOnly_/i, "").toLowerCase();
+    dedupMap.set(`${cleanDom}\t${cookie.name}`, cookie);
+  }
+  const usable = [...dedupMap.values()];
+
+  // Deduplicate header by cookie name, preferring .youtube.com over .google.com
+  // when a browser export carries both.
+  const headerMap = new Map();
+  for (const cookie of usable) {
+    const cleanDom = String(cookie.domain || "").replace(/^#HttpOnly_/i, "");
+    const isYt = /(^|\.)youtube\.com$/i.test(cleanDom);
+    if (!headerMap.has(cookie.name) || isYt) {
+      headerMap.set(cookie.name, cookie.value);
+    }
+  }
+  const header = [...headerMap.entries()].map(([name, val]) => `${name}=${val}`).join("; ");
 
   let netscape;
   if (isNetscape) {
-    // Rebuild from the filtered cookies (keeping their own domains/expiry) so
-    // no unrelated site's cookie survives into the file.
-    const lines = usable.map((cookie) => {
-      const line = text
-        .split(/\r?\n/)
-        .find((entry) => !entry.startsWith("#") && entry.split("\t")[5] === cookie.name);
-      return line ? line.trim() : null;
-    });
-    netscape = `${NETSCAPE_HEADER}${lines.filter(Boolean).join("\n")}\n`;
+    // Preserve each cookie's own Netscape line (including its exact domain and
+    // #HttpOnly_ prefix) instead of looking up by name with .find(), which
+    // previously overwrote .youtube.com cookies with .google.com ones.
+    const lines = usable.map((cookie) => cookie.line).filter(Boolean);
+    netscape = `${NETSCAPE_HEADER}${lines.join("\n")}\n`;
   } else {
     const expiry = Math.floor(Date.now() / 1000) + 365 * 24 * 60 * 60;
     const lines = usable.map(({ name, value }) => {

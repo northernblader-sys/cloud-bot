@@ -126,16 +126,17 @@ async function createClient(clientName) {
 }
 
 function getClient(clientName) {
-  const cached = clientPromises.get(clientName);
+  const cacheKey = `${clientName}|${session.header() || ""}`;
+  const cached = clientPromises.get(cacheKey);
   if (cached && Date.now() - cached.createdAt < CLIENT_TTL_MS) return cached.promise;
 
   const entry = { createdAt: Date.now() };
   entry.promise = createClient(clientName).catch((err) => {
     // Don't cache a broken session — the next attempt should retry.
-    clientPromises.delete(clientName);
+    clientPromises.delete(cacheKey);
     throw err;
   });
-  clientPromises.set(clientName, entry);
+  clientPromises.set(cacheKey, entry);
   return entry.promise;
 }
 

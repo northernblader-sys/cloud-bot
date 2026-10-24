@@ -127,6 +127,36 @@ test("cookies: cookies for other sites are dropped, not stored or sent", () => {
   });
 });
 
+test("cookies: keeps #HttpOnly_ lines and preserves .youtube.com alongside .google.com", () => {
+  withoutEnv(() => {
+    session.clearCookies();
+    session._reset();
+
+    const realExport = [
+      "# Netscape HTTP Cookie File",
+      "#HttpOnly_.google.com\tTRUE\t/\tTRUE\t1893456000\tSID\tGOOGLE_SID",
+      "#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t1893456000\tSID\tYOUTUBE_SID",
+      "#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t1893456000\t__Secure-3PSID\tYT_3PSID",
+      "#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t1893456000\tLOGIN_INFO\tYT_LOGIN",
+      ".youtube.com\tTRUE\t/\tTRUE\t1893456000\tSAPISID\tYT_SAPISID",
+    ].join("\n");
+
+    const saved = session.setCookies(realExport);
+    assert.equal(saved.count, 5);
+    assert.equal(saved.signedIn, true);
+
+    const file = readFileSync(session.cookieFile(), "utf8");
+    assert.match(file, /#HttpOnly_\.youtube\.com\tTRUE\t\/\tTRUE\t1893456000\tSID\tYOUTUBE_SID/);
+    assert.match(file, /#HttpOnly_\.youtube\.com\tTRUE\t\/\tTRUE\t1893456000\t__Secure-3PSID\tYT_3PSID/);
+    assert.match(file, /#HttpOnly_\.google\.com\tTRUE\t\/\tTRUE\t1893456000\tSID\tGOOGLE_SID/);
+
+    // Header prefers .youtube.com value and deduplicates SID.
+    const header = session.header();
+    assert.match(header, /SID=YOUTUBE_SID/);
+    assert.doesNotMatch(header, /SID=GOOGLE_SID/);
+  });
+});
+
 test("cookies: base64 is accepted, because a chat paste has no tabs", () => {
   withoutEnv(() => {
     session.clearCookies();
