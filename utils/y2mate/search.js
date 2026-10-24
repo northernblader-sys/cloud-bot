@@ -85,6 +85,38 @@ async function searchWithClient(clientName, query) {
   };
 }
 
+async function lookupViaOembed(videoId) {
+  const url = `https://www.youtube.com/oembed?url=${encodeURIComponent(
+    `https://www.youtube.com/watch?v=${videoId}`
+  )}&format=json`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10000);
+  try {
+    const res = await fetch(url, {
+      headers: {
+        "user-agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        accept: "application/json",
+      },
+      signal: controller.signal,
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (!data || !data.title) return null;
+    return {
+      id: videoId,
+      title: String(data.title).trim(),
+      thumbnail: data.thumbnail_url || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+      author: String(data.author_name || "").trim(),
+      durationSec: 0,
+    };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function searchYoutube(query) {
   const input = String(query || "").trim();
   const directId = extractVideoId(input);
@@ -95,15 +127,21 @@ async function searchYoutube(query) {
   const failures = [];
   for (const attempt of attempts) {
     try {
-      return await attempt();
+      const found = await attempt();
+      if (found && found.title && found.title !== directId) return found;
+      if (found && !directId) return found;
     } catch (err) {
       failures.push(err.message);
     }
   }
 
   // A direct link or bare video id is still usable for downloading even when
-  // metadata lookup is blocked — the player only needs the id.
+  // InnerTube metadata lookup is blocked — oEmbed never triggers YouTube's
+  // player bot-check and still gives us the real song title + artist for
+  // SoundCloud/API fallbacks.
   if (directId && (isYoutubeInput(input) || /^[-_0-9A-Za-z]{11}$/.test(input))) {
+    const oembed = await lookupViaOembed(directId);
+    if (oembed) return oembed;
     return { id: directId, title: directId, thumbnail: null, author: "", durationSec: 0 };
   }
 

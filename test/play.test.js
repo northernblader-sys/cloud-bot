@@ -959,3 +959,91 @@ test("play: tries both yt-dlp passes before other sources", async () => {
   assert.ok(Buffer.isBuffer(result.audio));
   assert.deepEqual(calls, ["basic", "arroxy"]);
 });
+
+test("ytdlp: SoundCloud search fallback strips YouTube noise and accepts exit code 101", async () => {
+  const ytdlp = require(path.join(ROOT, "utils", "youtube", "ytdlp.js"));
+  const log = path.join(await mkdtemp(path.join(os.tmpdir(), "ytdlp-sc-")), "calls.log");
+
+  const bin = await writeFakeYtdlp(`
+echo "$@" >> "${log}"
+out=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-o" ]; then out="$arg"; fi
+  prev="$arg"
+done
+file=$(printf '%s' "$out" | sed 's/%(ext)s/mp3/')
+printf 'ID3' > "$file"
+head -c 5000 /dev/zero | tr '\\0' 'A' >> "$file"
+printf '{"title":"Sia - Snowman","uploader":"Sia","duration":173}' > "$file.info.json"
+exit 101
+`);
+
+  process.env.YTDLP_PATH = bin;
+  ytdlp._reset();
+
+  try {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "ytdlp-sc-out-"));
+    const target = path.join(dir, "sc.mp3");
+    const result = await ytdlp.fetchAudioWithYtdlpSearch(
+      {
+        title: "Sia - Snowman [Official Video]",
+        author: "SiaVEVO",
+        durationSec: 173,
+        query: "snowman",
+      },
+      target
+    );
+
+    assert.equal(result.source, "yt-dlp (soundcloud)");
+    assert.equal(result.durationSec, 173);
+    assert.ok(readFileSync(target).subarray(0, 3).toString() === "ID3");
+
+    const calls = readFileSync(log, "utf8").trim();
+    assert.match(calls, /scsearch5:Sia - Snowman/);
+    assert.doesNotMatch(calls, /\[Official Video\]/);
+  } finally {
+    delete process.env.YTDLP_PATH;
+    ytdlp._reset();
+  }
+});
+
+test("play: rescues track via SoundCloud when YouTube blocks yt-dlp and InnerTube", async () => {
+  const calls = [];
+  const playSong = withPlayDependencies({
+    ytdlp: {
+      hasYtdlp: () => true,
+      fetchAudioWithYtdlp: async (id, file, options = {}) => {
+        calls.push(`yt:${options.strategy}`);
+        const err = new Error("ERROR: [youtube] gset79KMmt0: Sign in to confirm you're not a bot");
+        err.kind = "botBlock";
+        throw err;
+      },
+      fetchAudioWithYtdlpSearch: async (meta, file) => {
+        calls.push(`sc:${meta.title}`);
+        writeFileSync(file, Buffer.concat([Buffer.from("ID3"), Buffer.alloc(4096, 2)]));
+        return {
+          source: "yt-dlp (soundcloud)",
+          mimeType: "audio/mpeg",
+          title: meta.title,
+          durationSec: 200,
+        };
+      },
+    },
+    innertube: {
+      ...idleCleanup,
+      fetchAudioToFile: async () => {
+        calls.push("innertube");
+        throw new Error("LOGIN_REQUIRED: Sign in to confirm you're not a bot");
+      },
+    },
+    y2mate: async () => {
+      calls.push("y2mate");
+      throw new Error("should not be reached");
+    },
+  });
+
+  const result = await playSong(fakeSock(), { key: { remoteJid: "1@g.us" } }, "snowman");
+  assert.ok(Buffer.isBuffer(result.audio));
+  assert.deepEqual(calls, ["yt:basic", "yt:arroxy", "innertube", "sc:Test Song"]);
+});
