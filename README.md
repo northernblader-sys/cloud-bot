@@ -37,6 +37,63 @@ pm2 save
 | `.tenor <query>[, count]` | Search Tenor and send back animated stickers |
 | `.about` | About Astral Cloud |
 
+## 🏰 Astral RPG
+
+A full little RPG lives in the bot: profiles, levels, solars/gems, a gacha
+spin, turn-based battles, a hospital every death respawns at, and a mansion.
+All balance numbers, prices, images and dialogue live in **`utils/rpgData.js`**
+— edit there, nothing else needs touching (e.g. paste a hospital image link
+into `IMAGES.hospital`; it is `null` = text-only until then). Players and
+battles persist through `utils/persist.js` as `rpgPlayers`/`rpgBattles`
+(MongoDB when configured, `data/*.json` otherwise).
+
+| Command | Description |
+|---|---|
+| `.rpg` | Game guide |
+| `.start` | Create your profile (Lv1, 10,000 solars, 15 gems) — auto-created on first RPG command |
+| `.stats [@user]` / `.bal` | Profile card / wallet |
+| `.daily` | 5,000 solars + 3 gems every 24h (works in hospital too) |
+| `.spin` | Spin for Clane — 1.5 gems, roll 1–300 |
+| `.clane [info]` | Clane status / info card |
+| `.clane <text>` | Talk to her (owner only) — see below 🩸 |
+| `.clane summon` / `.clane dismiss` | Blood Siphon on/off in battle |
+| `.battle @user` · `accept` · `attack` · `flee` · `status` | Turn-based PvP; loser at 0 HP dies |
+| `.hospital` · `.hospital pay` | Astral Town Hospital — **every** death respawns here |
+| `.mansion` · `buy` · `enter`/`leave` · `butlers` · `hire`/`fire` · `clean` · `harem` | The mansion (5,000,000 solars) |
+| `.brothel` · `view <name>` · `take <name>` | Astral Town Brothel waifus → mansion harem |
+| `.give @user solars/gems <amt>` · `.give @user clane` | 👑 Owner-only grants (`400k`/`5m` amounts work) |
+
+**🧛‍♀️ Clane, the Crimson Vampire.** Won from `.spin`: a roll of **1–257 is
+the deadzone**, **258–300 enters a 50/50** for her (~7% per spin overall;
+duplicates convert to +5 gems and +5 bond). In battle, on **every turn of her
+owner**, her *Blood Siphon* sucks **30% of the opponent's current HP** and
+**5% of her owner's current HP** (`.clane dismiss` to switch it off). Owners
+talk to her with `.clane <text>` — she answers in her adult form. Every
+exchange raises her **thirst** (+1 per talk, −1 per hour ignored; shown on
+`.stats`/`.clane`): from thirst 3 she starts sipping the owner's HP
+mid-conversation (5% → 10% → 15% of max HP as she goes from blood-scented to
+ravenous), and she **can drink the owner to death**.
+
+**🏥 Astral Town Hospital.** Every death from any source (Clane's talking,
+her battle drain — including killing her own owner — or battle wounds)
+respawns you here with a level-based bill that must be paid
+(`.hospital pay`, discharged at full HP) before you can spin, battle, talk,
+use the mansion or brothel again: **Lv<30 = 5,000 · Lv30–99 = 50,000 ·
+Lv100 = 400,000 · Lv101+ = 500,000 solars**. `.daily` still works inside so
+patients are never soft-locked.
+
+**🏰 The Mansion (Astral).** Buy for **5,000,000 solars**
+(`.mansion buy`). `.mansion enter` starts a stay: each full hour settled
+lazily grants **+5 to one random stat** (ATK/DEF/SPD; max 24h per stay).
+Hire either/both butlers — **Reginald Ashworth** and **Phineas Bellweather**,
+**50,000 solars/hour each** while you stay — and they hold cleanliness at
+100%; without one it decays 15%/hour and stat gains stop at 0% (`.mansion
+clean` is the manual option). Unpaid butlers stop cleaning rather than
+driving you negative. Servants can be hired without limit (20,000 solars
+one-time each), and the harem holds up to **3** waifus taken from the brothel
+(**Cin**, **Noellle**, **Kaspavor**, 250,000 solars each). HP also regenerates
+passively while alive (+2% of max every 5 minutes).
+
 ## The `.cloud` brain
 
 `.cloud <anything>` routes a natural-language message to one of the bot's

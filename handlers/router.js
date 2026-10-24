@@ -46,9 +46,11 @@ const { sevenZip } = require("../commands/sevenzip");
 const { animeSearch } = require("../commands/anime");
 const { movieSearch } = require("../commands/movie");
 const { playChess } = require("../commands/games/chess");
+const { handleRpg } = require("../commands/games/rpg");
 const { joinGroup, leaveGroup } = require("../commands/group/joinLeave");
 
 const MENU_IMAGE = path.join(__dirname, "..", "assets", "cloud.jpg");
+const MENU_IMAGE_URL = "https://i.ibb.co/0jkMrkXS/menu-2026-10-24-04-16-13-393126.webp";
 
 async function handleMessage(sock, msg) {
   const from = msg.key.remoteJid;
@@ -94,14 +96,24 @@ async function handleMessage(sock, msg) {
     case "help": {
       const menuText = buildMenu(pushName);
 
-      if (fs.existsSync(MENU_IMAGE)) {
+      // Main menu banner is the hosted image; the old bundled
+      // assets/cloud.jpg stays as a fallback if the link is down.
+      try {
         await sock.sendMessage(
           from,
-          { image: fs.readFileSync(MENU_IMAGE), caption: menuText },
+          { image: { url: MENU_IMAGE_URL }, caption: menuText },
           { quoted: msg }
         );
-      } else {
-        await sock.sendMessage(from, { text: menuText }, { quoted: msg });
+      } catch {
+        if (fs.existsSync(MENU_IMAGE)) {
+          await sock.sendMessage(
+            from,
+            { image: fs.readFileSync(MENU_IMAGE), caption: menuText },
+            { quoted: msg }
+          );
+        } else {
+          await sock.sendMessage(from, { text: menuText }, { quoted: msg });
+        }
       }
       break;
     }
@@ -416,6 +428,27 @@ async function handleMessage(sock, msg) {
 
     case "chess": {
       const result = await playChess(sock, msg, argText);
+      if (result) {
+        await sock.sendMessage(from, result, { quoted: msg });
+      }
+      break;
+    }
+
+    // ── 🏰 Astral RPG (Clane, hospital, battles, mansion) ──
+    case "rpg":
+    case "start":
+    case "stats":
+    case "bal":
+    case "balance":
+    case "daily":
+    case "spin":
+    case "clane":
+    case "battle":
+    case "hospital":
+    case "mansion":
+    case "brothel":
+    case "give": {
+      const result = await handleRpg(sock, msg, command, argText);
       if (result) {
         await sock.sendMessage(from, result, { quoted: msg });
       }

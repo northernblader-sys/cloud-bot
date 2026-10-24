@@ -14,6 +14,8 @@ const FILES = {
   groupSettings: "groupSettings.json",
   trustedUsers: "trustedUsers.json",
   chessGames: "chessGames.json",
+  rpgPlayers: "rpgPlayers.json",
+  rpgBattles: "rpgBattles.json",
 };
 
 const cache = new Map(); // name -> value

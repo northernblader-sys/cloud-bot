@@ -23,6 +23,11 @@ ${PREFIX}pinterest · ${PREFIX}fb · ${PREFIX}dl
 🎮 ${fonts.mono("Games")}
 ${PREFIX}chess · ${PREFIX}anime · ${PREFIX}movie
 
+🏰 ${fonts.mono("Astral RPG")}
+${PREFIX}rpg · ${PREFIX}start · ${PREFIX}stats · ${PREFIX}bal · ${PREFIX}daily
+${PREFIX}spin · ${PREFIX}clane · ${PREFIX}battle
+${PREFIX}hospital · ${PREFIX}mansion · ${PREFIX}brothel
+
 🤖 ${fonts.mono("AI")}
 ${PREFIX}cloud <ask anything>
 
