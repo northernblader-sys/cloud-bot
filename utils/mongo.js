@@ -5,7 +5,6 @@
 //   MONGODB_DB   database name            (default: astral_cloud)
 //   BOT_ID       prefix for collections   (default: astral) — give each bot
 //                its own value if two bots share one database.
-const { MongoClient } = require("mongodb");
 
 const URI = process.env.MONGODB_URI || "";
 const DB_NAME = process.env.MONGODB_DB || "astral_cloud";
@@ -21,6 +20,7 @@ function enabled() {
 async function connect() {
   if (!URI) return null;
   if (db) return db;
+  const { MongoClient } = require("mongodb");
   client = new MongoClient(URI, {
     serverSelectionTimeoutMS: 15_000,
     maxPoolSize: 5,

@@ -184,9 +184,23 @@ async function fromInvidious(videoId, instance) {
 
   if (!fallback) throw new Error("no audio formats returned");
 
+  // googlevideo.com URLs returned by Invidious are IP-bound to the Invidious
+  // server itself and return HTTP 403 if fetched directly from our IP — rewrite
+  // them to proxy through the Invidious instance's /videoplayback endpoint.
+  let streamUrl = fallback.url;
+  try {
+    const parsed = new URL(streamUrl);
+    if (/\.googlevideo\.com$/i.test(parsed.hostname)) {
+      parsed.searchParams.set("host", parsed.hostname);
+      streamUrl = `${base}${parsed.pathname}${parsed.search}`;
+    }
+  } catch {
+    // keep fallback.url as-is
+  }
+
   return {
     provider: `invidious:${new URL(base).host}`,
-    url: fallback.url,
+    url: streamUrl,
     mimeType: fallback.mime,
     title: data.title || "",
     author: data.author || "",

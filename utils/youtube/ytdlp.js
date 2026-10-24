@@ -484,8 +484,12 @@ async function fetchAudioWithYtdlp(videoId, filePath, options = {}) {
   const url = `https://www.youtube.com/watch?v=${videoId}`;
 
   // Writing the cookie file is cheap and idempotent; null when none are set.
+  // Include the active cookie header in cookieState so replacing cookies via
+  // `.play cookie` immediately invalidates any memoised bot-block from older cookies.
   const cookiePath = session.cookieFile();
-  const cookieState = cookiePath ? session.source() || "file" : "none";
+  const cookieState = cookiePath
+    ? `${session.source() || "file"}:${session.header() || ""}`
+    : "none";
 
   let attempts;
   if (strategy === "arroxy") {

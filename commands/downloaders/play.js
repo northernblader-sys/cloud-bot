@@ -284,7 +284,28 @@ async function handleCookieCommand(msg, argument) {
     };
   }
 
-  const arg = String(argument || "").trim();
+  let arg = String(argument || "").trim();
+
+  // Also allow sending or replying to a cookies.txt document directly in DM
+  // with `.play cookie`, so the owner doesn't even have to base64-encode it.
+  if (!arg) {
+    const directDoc = msg.message?.documentMessage;
+    const quotedDoc =
+      msg.message?.extendedTextMessage?.contextInfo?.quotedMessage?.documentMessage;
+    if (directDoc || quotedDoc) {
+      try {
+        const { downloadMediaMessage } = require("@whiskeysockets/baileys");
+        const { getQuotedMedia } = require("../../utils/quotedMessage");
+        const target = directDoc ? msg : getQuotedMedia(msg)?.targetMsg;
+        if (target) {
+          const buf = await downloadMediaMessage(target, "buffer", {}, { logger: undefined });
+          arg = buf.toString("utf8").trim();
+        }
+      } catch {
+        // fall through to status() if document download fails
+      }
+    }
+  }
 
   if (!arg) return { text: ytSession.status().text };
 
