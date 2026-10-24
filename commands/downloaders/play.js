@@ -1,35 +1,176 @@
+// `.play` — search YouTube, then fetch the audio through public downloader
+// APIs. Same approach as Knightbot-MD: the bot never talks to YouTube's
+// media servers itself, so a datacenter IP can't trigger YouTube's bot check.
+//
+//   1. search   yt-search (a plain search-results lookup, no login needed)
+//   2. download EliteProTech -> Yupra -> Okatsu -> Keith, first one that
+//               really returns audio bytes wins
+//   3. send     converted to MP3 with ffmpeg when available
+//
+// None of these APIs need a key or credentials.
+
 const { createRequire } = require("module");
 const { spawnSync } = require("child_process");
-const { existsSync } = require("fs");
-const { readFile, rm, mkdir, stat } = require("fs/promises");
+const { existsSync, createWriteStream } = require("fs");
+const { readFile, rm, mkdir, stat, open } = require("fs/promises");
+const { pipeline } = require("stream/promises");
 const { randomUUID } = require("crypto");
 const { join } = require("path");
+const { tmpdir } = require("os");
+
+const axios = require("axios");
+const yts = require("yt-search");
 
 const require2 = createRequire(__filename);
 const ffmpeg = require2("fluent-ffmpeg");
 const ffmpegBinary = require2("ffmpeg-static");
 
-const { searchYoutube } = require("../../utils/y2mate/search");
-const { fetchAudioToFile, cleanupFile, TEMP_DIR } = require("../../utils/youtube/innertube");
-const { fetchAudioFromApis, isLikelyAudio } = require("../../utils/youtube/audioApis");
-const {
-  fetchAudioWithYtdlp,
-  fetchAudioWithYtdlpSearch,
-  hasYtdlp,
-} = require("../../utils/youtube/ytdlp");
-const { downloadY2mateAudioToFile } = require("../../utils/y2mate/audio");
-const ytSession = require("../../utils/youtube/session");
-const { isOwnerMessage } = require("../../utils/owner");
-
 // WhatsApp tops out around 16 MB for playable audio; stay a bit under it.
 const WHATSAPP_AUDIO_LIMIT = 15.5 * 1024 * 1024;
-const MAX_SOURCE_BYTES = 300 * 1024 * 1024;
+const MAX_SOURCE_BYTES = 100 * 1024 * 1024;
 const CONVERT_TIMEOUT_MS = 5 * 60 * 1000;
+const API_TIMEOUT_MS = 60 * 1000;
+const FILE_TIMEOUT_MS = 90 * 1000;
+const TEMP_DIR = join(tmpdir(), "astral-cloud-music");
 
-// ── ffmpeg setup ───────────────────────────────────────────────────
-// Prefer the bundled static binary, but fall back to whatever ffmpeg is on
-// PATH (some hosts ship one), and keep working even if neither exists — an
-// m4a/opus file is still a valid WhatsApp audio message.
+const BROWSER_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+const API_HEADERS = { "User-Agent": BROWSER_UA, Accept: "application/json, text/plain, */*" };
+
+// ── download sources ───────────────────────────────────────────────
+// Each source takes a YouTube URL and resolves to { download, title?, thumbnail? }.
+// Order matches Knightbot-MD's `.song` chain, with `.play`'s Keith API last.
+async function getJson(url) {
+  const res = await axios.get(url, { timeout: API_TIMEOUT_MS, headers: API_HEADERS });
+  return res.data;
+}
+
+const SOURCES = [
+  {
+    name: "EliteProTech",
+    async resolve(youtubeUrl) {
+      const data = await getJson(
+        `https://eliteprotech-apis.zone.id/ytdown?url=${encodeURIComponent(youtubeUrl)}&format=mp3`
+      );
+      if (data?.success && data?.downloadURL) {
+        return { download: data.downloadURL, title: data.title };
+      }
+      throw new Error("returned no download link");
+    },
+  },
+  {
+    name: "Yupra",
+    async resolve(youtubeUrl) {
+      const data = await getJson(
+        `https://api.yupra.my.id/api/downloader/ytmp3?url=${encodeURIComponent(youtubeUrl)}`
+      );
+      if (data?.success && data?.data?.download_url) {
+        return {
+          download: data.data.download_url,
+          title: data.data.title,
+          thumbnail: data.data.thumbnail,
+        };
+      }
+      throw new Error("returned no download link");
+    },
+  },
+  {
+    name: "Okatsu",
+    async resolve(youtubeUrl) {
+      const data = await getJson(
+        `https://okatsu-rolezapiiz.vercel.app/downloader/ytmp3?url=${encodeURIComponent(youtubeUrl)}`
+      );
+      if (data?.dl) {
+        return { download: data.dl, title: data.title, thumbnail: data.thumb };
+      }
+      throw new Error("returned no download link");
+    },
+  },
+  {
+    name: "Keith",
+    async resolve(youtubeUrl) {
+      const data = await getJson(
+        `https://apis-keith.vercel.app/download/dlmp3?url=${encodeURIComponent(youtubeUrl)}`
+      );
+      if (data?.status && data?.result?.downloadUrl) {
+        return { download: data.result.downloadUrl, title: data.result.title };
+      }
+      throw new Error("returned no download link");
+    },
+  },
+];
+
+// ── audio sniffing ─────────────────────────────────────────────────
+function isLikelyAudio(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 16) return false;
+
+  const head = buffer.subarray(0, 16);
+  const ascii = head.toString("latin1");
+
+  if (ascii.startsWith("ID3")) return true; // MP3 with ID3 tag
+  if (head[0] === 0xff && (head[1] & 0xe0) === 0xe0) return true; // MPEG frame sync
+  if (ascii.slice(4, 8) === "ftyp") return true; // MP4/M4A/AAC container
+  if (head[0] === 0x1a && head[1] === 0x45 && head[2] === 0xdf && head[3] === 0xa3) return true; // WebM
+  if (ascii.startsWith("OggS")) return true; // Ogg/Opus
+  if (ascii.startsWith("RIFF") && ascii.slice(8, 12) === "WAVE") return true; // WAV
+  if (ascii.startsWith("fLaC")) return true; // FLAC
+
+  return false;
+}
+
+function isMp3Buffer(buffer) {
+  return (
+    Buffer.isBuffer(buffer) &&
+    buffer.length > 3 &&
+    (buffer.subarray(0, 3).toString() === "ID3" ||
+      (buffer[0] === 0xff && (buffer[1] & 0xe0) === 0xe0))
+  );
+}
+
+function extensionForHead(head) {
+  const ascii = head.toString("latin1");
+  if (isMp3Buffer(head)) return "mp3";
+  if (ascii.slice(4, 8) === "ftyp") return "m4a";
+  if (ascii.startsWith("OggS")) return "ogg";
+  if (head[0] === 0x1a && head[1] === 0x45 && head[2] === 0xdf && head[3] === 0xa3) return "webm";
+  if (ascii.startsWith("RIFF")) return "wav";
+  if (ascii.startsWith("fLaC")) return "flac";
+  return "m4a";
+}
+
+const MIME_BY_EXTENSION = {
+  mp3: "audio/mpeg",
+  m4a: "audio/mp4",
+  ogg: "audio/ogg; codecs=opus",
+  webm: "audio/webm",
+  wav: "audio/wav",
+  flac: "audio/flac",
+};
+
+async function readHead(filePath, length = 64) {
+  const handle = await open(filePath, "r");
+  try {
+    const buffer = Buffer.alloc(length);
+    const { bytesRead } = await handle.read(buffer, 0, length, 0);
+    return buffer.subarray(0, bytesRead);
+  } finally {
+    await handle.close().catch(() => {});
+  }
+}
+
+async function fileSize(path) {
+  return stat(path)
+    .then((s) => s.size)
+    .catch(() => 0);
+}
+
+async function cleanupFile(path) {
+  await rm(path, { force: true }).catch(() => {});
+}
+
+// ── ffmpeg ─────────────────────────────────────────────────────────
+// Prefer the bundled static binary, fall back to ffmpeg on PATH, and keep
+// working without either: an m4a/ogg file is still a valid WhatsApp audio.
 let ffmpegPath = null;
 let ffmpegChecked = false;
 
@@ -45,7 +186,7 @@ function resolveFfmpeg() {
   }
 
   if (ffmpegPath) ffmpeg.setFfmpegPath(ffmpegPath);
-  else console.warn("[play] ffmpeg not found — sending the original audio stream as-is");
+  else console.warn("[play] ffmpeg not found — sending the original audio as-is");
   return ffmpegPath;
 }
 
@@ -85,209 +226,6 @@ function pickBitrate(durationSec) {
   return Math.min(192, Math.max(48, kbps));
 }
 
-const MIME_BY_EXTENSION = {
-  mp3: "audio/mpeg",
-  webm: "audio/webm",
-  m4a: "audio/mp4",
-};
-
-function extensionForMime(mimeType) {
-  const mime = String(mimeType || "").toLowerCase();
-  if (mime.includes("mpeg") || mime.includes("mp3")) return "mp3";
-  if (mime.includes("webm") || mime.includes("opus")) return "webm";
-  if (mime.includes("mp4") || mime.includes("m4a") || mime.includes("aac")) return "m4a";
-  return "m4a";
-}
-
-function isMp3Buffer(buffer) {
-  return (
-    Buffer.isBuffer(buffer) &&
-    buffer.length > 3 &&
-    (buffer.subarray(0, 3).toString() === "ID3" ||
-      (buffer[0] === 0xff && (buffer[1] & 0xe0) === 0xe0))
-  );
-}
-
-function hasDuration(durationSec) {
-  return Number.isFinite(Number(durationSec)) && Number(durationSec) > 0;
-}
-
-async function fileSize(path) {
-  return stat(path)
-    .then((s) => s.size)
-    .catch(() => 0);
-}
-
-// Baileys' audio message proto has no thumbnail field (jpegThumbnail is only
-// on image/video/document messages), so the cover art is sent as its own
-// image with a caption first — that is what actually shows up as a visible
-// thumbnail in every client.
-async function fetchThumbnailBuffer(url) {
-  if (!url) return null;
-  try {
-    const res = await fetch(url);
-    if (!res.ok) return null;
-    return Buffer.from(await res.arrayBuffer());
-  } catch {
-    return null;
-  }
-}
-
-// Source order, best first:
-//   1. yt-dlp (YouTube)   — basic + arroxy ladder
-//   2. YouTube InnerTube  — highest quality, one request
-//   3. yt-dlp (SoundCloud)— bypasses YouTube datacenter IP blocks completely
-//   4. public APIs        — OceanSaver / api-faa / Piped / Invidious / cobalt
-//   5. y2mate             — HTML scraper, last resort
-// Each stage only wins if it actually produced audio bytes, and each failure
-// is collected so the error we surface says which stage died and why.
-async function downloadAudioSource(videoId, filePath, meta = {}) {
-  const stages = [];
-
-  // Reasons worth surfacing verbatim: they say what to configure.
-  const reasonsOf = (error) =>
-    (error.failures || [])
-      .map((failure) => failure.error || failure.message || String(failure))
-      .filter(Boolean);
-
-  const canRunYtdlp = hasYtdlp() || process.env.YTDLP_AUTODOWNLOAD !== "0";
-
-  // yt-dlp first when it's already installed: it follows YouTube's anti-bot
-  // changes (PO tokens, nsig challenges) faster than any library can, and it
-  // is the approach proven by desktop downloaders. Autodownloading it is
-  // handled inside (YTDLP_AUTODOWNLOAD=0 disables the ~30 MB fetch).
-  //
-  // Two yt-dlp passes: the plain desktop-app recipe, then Arroxy's retry
-  // ladder (PO token if configured → clients that don't demand one → yt-dlp's
-  // own defaults), which is what rescues videos the first pass can't reach.
-  if (videoId && canRunYtdlp) {
-    const strategies = [
-      { strategy: "basic", label: "yt-dlp" },
-      { strategy: "arroxy", label: "yt-dlp (arroxy)" },
-    ];
-
-    for (const { strategy, label } of strategies) {
-      try {
-        return await fetchAudioWithYtdlp(videoId, filePath, {
-          maxBytes: MAX_SOURCE_BYTES,
-          strategy,
-        });
-      } catch (error) {
-        stages.push({ stage: label, error, reasons: reasonsOf(error) });
-        console.warn(`[play] ${label} failed: ${error.message}`);
-        // A rate limit or a removed video won't be fixed by another source.
-        if (error.kind === "rateLimit") {
-          const error2 = new Error(error.message);
-          error2.kind = error.kind;
-          error2.stages = stages;
-          error2.code = "DOWNLOAD_FAILED";
-          throw error2;
-        }
-      }
-    }
-  }
-
-  if (videoId) {
-    try {
-      return await fetchAudioToFile(videoId, filePath, { maxBytes: MAX_SOURCE_BYTES });
-    } catch (error) {
-      stages.push({ stage: "YouTube", error, reasons: reasonsOf(error) });
-      console.warn("[play] InnerTube failed, trying SoundCloud / public audio APIs");
-    }
-  }
-
-  // When YouTube blocks the host's datacenter IP, yt-dlp can still fetch the
-  // track straight from SoundCloud (`scsearch5:`) without cookies or BotGuard.
-  if (
-    canRunYtdlp &&
-    typeof fetchAudioWithYtdlpSearch === "function" &&
-    (meta.title || meta.query)
-  ) {
-    try {
-      return await fetchAudioWithYtdlpSearch(meta, filePath, {
-        maxBytes: MAX_SOURCE_BYTES,
-      });
-    } catch (error) {
-      stages.push({ stage: "SoundCloud", error, reasons: reasonsOf(error) });
-      console.warn(`[play] SoundCloud (yt-dlp) failed: ${error.message}`);
-    }
-  }
-
-  if (videoId) {
-    try {
-      return await fetchAudioFromApis(videoId, filePath, { maxBytes: MAX_SOURCE_BYTES });
-    } catch (error) {
-      stages.push({ stage: "public APIs", error, reasons: reasonsOf(error) });
-      console.warn("[play] public audio APIs failed, trying y2mate");
-    }
-
-    try {
-      return await downloadY2mateAudioToFile(videoId, filePath);
-    } catch (error) {
-      stages.push({ stage: "y2mate", error, reasons: reasonsOf(error) });
-    }
-  }
-
-  const combined = new Error(
-    "every audio source refused this track:\n" +
-      stages
-        .map((entry) => {
-          const detail = entry.reasons[0] || entry.error.message || "unknown error";
-          return `• ${entry.stage}: ${detail}`;
-        })
-        .join("\n")
-  );
-  combined.code = "DOWNLOAD_FAILED";
-  combined.stages = stages;
-  throw combined;
-}
-
-// One short line per source, each with the most useful reason we have, then
-// the one action that actually fixes the common case.
-function describeFailure(error) {
-  const stages = error.stages || [];
-  if (!stages.length) return String(error.message || "unknown error").slice(0, 300);
-
-  const lines = stages.map((entry) => {
-    const detail = (entry.reasons[0] || entry.error.message || "failed")
-      .replace(/\s+/g, " ")
-      .trim()
-      .slice(0, 90);
-    return `• ${entry.stage}: ${detail}`;
-  });
-
-  const allText = stages
-    .map((entry) => [entry.error?.message, ...(entry.reasons || [])].filter(Boolean).join(" "))
-    .join(" ");
-  const blocked = /confirm you.{0,3}re not a bot|bot check|LOGIN_REQUIRED|sign in to confirm/i.test(
-    allText
-  );
-  if (!blocked) return lines.join("\n");
-
-  const state = ytSession.status();
-  if (!state.configured) {
-    lines.push(
-      "\n_YouTube is refusing this server's IP. It wants a logged-in session, " +
-        "and no client trick gets around that.\n" +
-        "Fix it once: export youtube cookies (browser extension \"Get cookies.txt LOCALLY\"), " +
-        "run `base64 -w0 cookies.txt`, then DM me `.play cookie <that text>`. " +
-        "It is stored with the bot's data, so it survives redeploys._"
-    );
-  } else if (state.signedIn) {
-    lines.push(
-      "\n_Your saved youtube cookies were rejected — most likely expired. " +
-        "Re-export them and send `.play cookie <base64>` again._"
-    );
-  } else {
-    lines.push(
-      "\n_The saved cookies aren't from a signed-in session (no `SID`/`HSID`), so " +
-        "YouTube still blocks. Re-export while logged in, then `.play cookie <base64>`._"
-    );
-  }
-
-  return lines.join("\n");
-}
-
 async function recompressUnderLimit(sourcePath, outputPath) {
   for (const bitrate of [48, 32, 24]) {
     await convertToMp3(sourcePath, outputPath, bitrate);
@@ -298,76 +236,112 @@ async function recompressUnderLimit(sourcePath, outputPath) {
   return null;
 }
 
-// ── `.play cookie` ─────────────────────────────────────────────────
-// The one thing that actually fixes "every source refused" on a datacenter
-// host is a logged-in YouTube session, and the only sane way to get that to a
-// deployed bot is to send it the cookies. Owner only, DM only: cookies are as
-// good as the account's password to anyone who reads them.
-async function handleCookieCommand(msg, argument) {
-  if (!isOwnerMessage(msg)) return { text: "only the owner can do that." };
+// ── search ─────────────────────────────────────────────────────────
+function extractVideoId(input) {
+  const match = String(input || "").match(
+    /(?:youtube\.com\/(?:watch\?(?:.*&)?v=|shorts\/|embed\/|live\/)|youtu\.be\/|music\.youtube\.com\/watch\?(?:.*&)?v=)([A-Za-z0-9_-]{11})/
+  );
+  return match ? match[1] : null;
+}
 
-  const inGroup = String(msg.key.remoteJid || "").endsWith("@g.us");
-  if (inGroup) {
-    return {
-      text: "dm me that instead, not here — youtube cookies are as good as a login.",
-    };
-  }
+function normalizeVideo(video) {
+  return {
+    id: video.videoId || extractVideoId(video.url),
+    url: video.url,
+    title: video.title || "audio",
+    author: video.author?.name || "",
+    durationSec: Number(video.seconds) || 0,
+    thumbnail: video.thumbnail || video.image || null,
+  };
+}
 
-  let arg = String(argument || "").trim();
+async function findVideo(query) {
+  const videoId = extractVideoId(query);
 
-  // Also allow sending or replying to a cookies.txt document directly in DM
-  // with `.play cookie`, so the owner doesn't even have to base64-encode it.
-  if (!arg) {
-    const directDoc = msg.message?.documentMessage;
-    const quotedDoc =
-      msg.message?.extendedTextMessage?.contextInfo?.quotedMessage?.documentMessage;
-    if (directDoc || quotedDoc) {
-      try {
-        const { downloadMediaMessage } = require("@whiskeysockets/baileys");
-        const { getQuotedMedia } = require("../../utils/quotedMessage");
-        const target = directDoc ? msg : getQuotedMedia(msg)?.targetMsg;
-        if (target) {
-          const buf = await downloadMediaMessage(target, "buffer", {}, { logger: undefined });
-          arg = buf.toString("utf8").trim();
-        }
-      } catch {
-        // fall through to status() if document download fails
-      }
+  if (videoId) {
+    const url = `https://www.youtube.com/watch?v=${videoId}`;
+    try {
+      const found = await yts({ videoId });
+      if (found?.title) return normalizeVideo({ ...found, url });
+    } catch {
+      // metadata lookup is optional when we already have the link
     }
+    return { id: videoId, url, title: "audio", author: "", durationSec: 0, thumbnail: null };
   }
 
-  if (!arg) return { text: ytSession.status().text };
+  const { videos } = await yts(String(query).trim());
+  if (!videos || !videos.length) throw new Error("No results found for that search.");
+  return normalizeVideo(videos[0]);
+}
 
-  if (/^(clear|remove|delete|reset)$/i.test(arg)) {
-    const removed = ytSession.clearCookies();
-    return { text: removed ? "🧹 youtube cookies removed." : "there were no saved cookies." };
-  }
-
+async function fetchThumbnailBuffer(url) {
+  if (!url) return null;
   try {
-    const saved = ytSession.setCookies(arg, msg.key.participant || msg.key.remoteJid);
-    return {
-      text:
-        `✅ saved ${saved.count} cookies` +
-        `${saved.signedIn ? " — signed-in session, good to go." : " — but none of them are a `SID`/`HSID`, so this is a visitor export and YouTube will still block you."}\n\n` +
-        "try `.play <song>` now. if it still refuses, the cookies are expired: " +
-        "re-export them and send them again.\n" +
-        "`.play cookie` shows the state, `.play cookie clear` removes them.",
-    };
-  } catch (err) {
-    return {
-      text:
-        `⚠️ ${err.message}\n\n` +
-        "expected either the cookies.txt file's contents or its base64 " +
-        "(`base64 -w0 cookies.txt`).",
-    };
+    const res = await axios.get(url, { responseType: "arraybuffer", timeout: 15000 });
+    return Buffer.from(res.data);
+  } catch {
+    return null;
   }
 }
 
+// ── download ───────────────────────────────────────────────────────
+// Stream a source's file URL to disk and make sure it is really audio. An
+// HTML or JSON error page served with a 200 must never reach WhatsApp.
+async function downloadToFile(url, filePath, maxBytes) {
+  const response = await axios.get(url, {
+    responseType: "stream",
+    timeout: FILE_TIMEOUT_MS,
+    maxRedirects: 5,
+    headers: { "User-Agent": BROWSER_UA, Accept: "*/*", "Accept-Encoding": "identity" },
+  });
+
+  let received = 0;
+  response.data.on("data", (chunk) => {
+    received += chunk.length;
+    if (received > maxBytes) response.data.destroy(new Error("file is too large"));
+  });
+
+  await pipeline(response.data, createWriteStream(filePath));
+
+  if (!received) throw new Error("file was empty");
+  const head = await readHead(filePath);
+  if (!isLikelyAudio(head)) throw new Error("returned a page instead of audio");
+  return { extension: extensionForHead(head) };
+}
+
+function describeError(error) {
+  const status = error?.response?.status;
+  if (status) return `HTTP ${status}`;
+  return String(error?.message || "failed").replace(/\s+/g, " ").trim().slice(0, 90);
+}
+
+async function downloadAudioSource(youtubeUrl, filePath, sources = SOURCES) {
+  const stages = [];
+
+  for (const source of sources) {
+    try {
+      const resolved = await source.resolve(youtubeUrl);
+      const { extension } = await downloadToFile(resolved.download, filePath, MAX_SOURCE_BYTES);
+      return { ...resolved, extension, source: source.name };
+    } catch (error) {
+      stages.push({ stage: source.name, error: describeError(error) });
+      console.warn(`[play] ${source.name} failed: ${describeError(error)}`);
+      await cleanupFile(filePath);
+    }
+  }
+
+  const failure = new Error(
+    "every audio source refused this track:\n" +
+      stages.map((entry) => `• ${entry.stage}: ${entry.error}`).join("\n")
+  );
+  failure.code = "DOWNLOAD_FAILED";
+  failure.stages = stages;
+  throw failure;
+}
+
+// ── command ────────────────────────────────────────────────────────
 async function playSong(sock, msg, query) {
   const from = msg.key.remoteJid;
-
-  const cookieCommand = /^cookies?(?:\s+([\s\S]*))?$/i.exec(String(query || "").trim());
-  if (cookieCommand) return handleCookieCommand(msg, cookieCommand[1]);
 
   if (!query || !query.trim()) {
     return { text: "⚠️ Usage: .play <song name or YouTube link>" };
@@ -377,22 +351,9 @@ async function playSong(sock, msg, query) {
 
   let video;
   try {
-    video = await searchYoutube(query);
+    video = await findVideo(query);
   } catch (err) {
-    if (
-      typeof fetchAudioWithYtdlpSearch === "function" &&
-      (hasYtdlp() || process.env.YTDLP_AUTODOWNLOAD !== "0")
-    ) {
-      video = {
-        id: null,
-        title: String(query).trim(),
-        author: "",
-        durationSec: 0,
-        thumbnail: null,
-      };
-    } else {
-      return { text: `⚠️ Couldn't find that song. ${err.message}` };
-    }
+    return { text: `⚠️ Couldn't find that song. ${err.message}` };
   }
 
   // Fetch the cover art once, reuse it for the "found" message and for the
@@ -418,38 +379,23 @@ async function playSong(sock, msg, query) {
   try {
     let source;
     try {
-      source = await downloadAudioSource(video.id, sourcePath, {
-        title: video.title,
-        author: video.author,
-        durationSec: video.durationSec,
-        query,
-      });
+      source = await downloadAudioSource(video.url, sourcePath);
     } catch (err) {
       console.error("[play] download failed:", err.message);
-
-      return {
-        text:
-          "⚠️ Couldn't get audio for that one — every source refused.\n\n" +
-          describeFailure(err),
-      };
-    }
-
-    const sourceSize = await fileSize(sourcePath);
-    if (!sourceSize) {
-      return { text: "⚠️ The downloaded audio was empty. Try another song." };
+      return { text: `⚠️ Couldn't get audio for that one.\n\n${err.message}` };
     }
 
     const title = (source.title || video.title || "audio")
       .replace(/[\\/:*?"<>|]/g, "_")
       .slice(0, 100);
-    const durationSec = source.durationSec || video.durationSec || 0;
+    const durationSec = video.durationSec || 0;
 
     let audioPath = sourcePath;
-    let extension = extensionForMime(source.mimeType);
+    let extension = source.extension;
     let mimetype = MIME_BY_EXTENSION[extension] || "audio/mpeg";
 
-    // y2mate already renders MP3. InnerTube hands us m4a/opus, which WhatsApp
-    // plays only sometimes, so convert whenever ffmpeg is available.
+    // WhatsApp plays m4a/ogg/webm only sometimes, so convert to MP3 whenever
+    // ffmpeg is available.
     if (extension !== "mp3" && resolveFfmpeg()) {
       try {
         await convertToMp3(sourcePath, mp3Path, pickBitrate(durationSec));
@@ -461,36 +407,20 @@ async function playSong(sock, msg, query) {
       }
     }
 
-    let buffer = await readFile(audioPath);
+    const buffer = await readFile(audioPath);
     if (!buffer.length) {
       return { text: "⚠️ The downloaded audio was empty. Try another song." };
     }
 
-    // Guard against a source that returned an HTML/JSON error page with a 200:
-    // sending that as a voice note looks like "it replied but no audio plays".
-    if (!isLikelyAudio(buffer.subarray(0, 64)) && !isMp3Buffer(buffer)) {
-      return {
-        text:
-          "⚠️ The download didn't come back as real audio (the source probably " +
-          "returned an error page). Try again or send a different song.",
-      };
-    }
-
-    // Some sources already deliver MP3 under a different mimetype label.
-    if (isMp3Buffer(buffer)) {
-      mimetype = "audio/mpeg";
-      extension = "mp3";
-    }
-
     // Passing `seconds` also stops Baileys from shelling out to ffmpeg to
     // measure the track itself.
-    const seconds = hasDuration(durationSec) ? { seconds: Math.round(durationSec) } : {};
+    const seconds = durationSec > 0 ? { seconds: Math.round(durationSec) } : {};
 
     if (buffer.length <= WHATSAPP_AUDIO_LIMIT) {
       return { audio: buffer, mimetype, ptt: false, ...seconds };
     }
 
-    // Too large to stream inline: try harder, then fall back to a document
+    // Too large to send inline: squeeze it, then fall back to a document
     // instead of letting WhatsApp reject the upload.
     if (resolveFfmpeg()) {
       const squeezed = await recompressUnderLimit(sourcePath, mp3Path).catch(() => null);
@@ -499,7 +429,6 @@ async function playSong(sock, msg, query) {
       }
     }
 
-    // Only documents carry a filename/thumbnail in WhatsApp.
     return {
       document: buffer,
       mimetype,
@@ -514,4 +443,8 @@ async function playSong(sock, msg, query) {
   }
 }
 
-module.exports = { playSong };
+module.exports = {
+  playSong,
+  // exported for tests
+  _internals: { downloadAudioSource, extractVideoId, isLikelyAudio, SOURCES, TEMP_DIR },
+};

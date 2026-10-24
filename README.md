@@ -83,125 +83,38 @@ commands, or answers it conversationally.
 | `.fb <url>` | Download a Facebook video/photo |
 | `.dl <url>` | Auto-detect the platform and download |
 
-`.play` fetches audio from several sources, in order, and only accepts a
-source that actually produced audio bytes:
+`.play` searches YouTube with the `yt-search` package (a plain search-results
+lookup, no login), then asks public downloader APIs for the audio. The bot
+never contacts YouTube's media servers itself, so a datacenter IP can't trigger
+YouTube's "Sign in to confirm you're not a bot" check. The same approach is
+used by Knightbot-MD. None of the APIs need a key.
 
-0. **yt-dlp** (`utils/youtube/ytdlp.js`) — the approach desktop downloaders
-   use, and the most reliable of the lot: yt-dlp follows YouTube's anti-bot
-   changes (PO tokens, nsig/sig challenges, new player clients) within days.
-   Two passes over the same binary:
-   - `basic` — the Refloow recipe: `-f bestaudio`, `--js-runtimes
-     node:<this bot's node>`, `youtube:player_client=default,web_safari`.
-   - `arroxy` — [Arroxy](https://github.com/antonio-orionus/Arroxy)'s retry
-     ladder: PO token + visitor data (when `YT_PO_TOKEN` is set) →
-     `player_client=default,-web,-web_safari` (VidBee's trick: drop the
-     clients that *demand* a token) → yt-dlp's own clients, with
-     `--ignore-config`, chunked HTTP, bounded retries and a stop at the first
-     rate limit instead of hammering YouTube.
+Sources are tried in order, and one only wins if it really returns audio bytes
+(an HTML or JSON error page served with a 200 is rejected):
 
-   The binary comes from `YTDLP_PATH`, `<DATA_DIR>/media/bin/`, `yt-dlp` on
-   `PATH`, or is downloaded once from the official GitHub release
-   (`YTDLP_AUTODOWNLOAD=0` disables that).
-1. **YouTube InnerTube** (`utils/youtube/innertube.js`) — several clients are
-   tried (TV first, since it still serves audio without a PO token) and the
-   first that returns real bytes wins. Highest quality, one request.
-2. **Public YouTube APIs** (`utils/youtube/audioApis.js`) — Piped, Invidious,
-   cobalt, or your own endpoint, so a blocked server IP still gets audio from
-   someone else's. Every response is magic-number checked, so an HTML "rate
-   limited" page is never sent as a voice note.
-3. **y2mate** (`utils/y2mate/audio.js`) — HTML scraper, last resort.
+1. **EliteProTech** — `eliteprotech-apis.zone.id/ytdown`
+2. **Yupra** — `api.yupra.my.id/api/downloader/ytmp3`
+3. **Okatsu** — `okatsu-rolezapiiz.vercel.app/downloader/ytmp3`
+4. **Keith** — `apis-keith.vercel.app/download/dlmp3`
 
-The winning source is streamed in verified byte ranges to a temp file,
-converted to MP3 with ffmpeg, and sent as a WhatsApp audio message (with the
-cover art as a thumbnail). If every source refuses, the reply lists one
-line per source with its real error, and — when YouTube is the blocker — points
-at the env var that fixes it.
+The winning file is streamed to a temp file, converted to MP3 with ffmpeg and
+sent as a WhatsApp audio message. If every source refuses, the reply lists one
+line per source with its real error.
 
 Notes:
 
 - Long tracks are re-encoded at a lower bitrate so the MP3 stays under
-  WhatsApp's ~16 MB media limit; anything still too large is sent as a
-  playable document instead of failing.
-- If ffmpeg isn't available the original m4a/webm audio is sent instead.
-- YouTube sometimes blocks datacenter IPs ("Sign in to confirm you're not a
-  bot"). Optional env vars help there: `YT_PO_TOKEN` (Proof-of-Origin token),
-  `YT_VISITOR_DATA`, `YT_COOKIE`, and `YT_CLIENTS` (comma-separated client
-  order override, e.g. `TVHTML5,iOS,WEB`).
-- yt-dlp knobs: `YTDLP_PATH` (use a specific binary), `YTDLP_AUTODOWNLOAD=0`
-  (never fetch it automatically), `YT_EXTRACTOR_ARGS` is not needed — the
-  working default is baked in. The binary is stored in `<DATA_DIR>/media/bin/`
-  so it survives restarts on hosts with a persistent volume.
-- Tune the fallback APIs with:
-  - `YT_AUDIO_APIS` — order/list of providers, e.g. `piped,cobalt`, or a bare
-    template URL `https://api.example/dl?id={id}` whose JSON/text response
-    contains the media link.
-  - `PIPED_INSTANCES`, `INVIDIOUS_INSTANCES`, `COBALT_INSTANCES`
-    (or `COBALT_API_URL`) — comma-separated base URLs to use instead of the
-    built-in public ones. Self-hosted instances are the most reliable fix if
-    public ones are slow or down.
+  WhatsApp's ~16 MB media limit; anything still too large is sent as a playable
+  document instead of failing.
+- If ffmpeg isn't available the original audio is sent instead.
+- These are small third-party services. They can change or go down without
+  notice. If one stops working, edit its entry in the `SOURCES` list at the top
+  of `commands/downloaders/play.js` (each entry is one `resolve(youtubeUrl)`
+  function), or add a new one.
 
-`.tiktok`/`.ig`/`.pinterest`/`.fb` use tikwm.com and api-faa.my.id. Those are
-third-party scraper APIs, not official platform APIs — they can change or go
-down without notice. If one stops working, the fix is updating the relevant
-fetch function in `utils/downloaders/fetchers.js`.
+`.tiktok`/`.ig`/`.pinterest`/`.fb` use tikwm.com and api-faa.my.id. Those are third-party scraper APIs, not official platform APIs — they can change or go down without notice. If one stops working, the fix is updating the relevant fetch function in `utils/downloaders/fetchers.js`.
 
 Replying to a message that contains a supported link also works for `.dl`.
-
-## When `.play` says "every source refused"
-
-On a datacenter host (Render, Railway, Fly, any VPS) YouTube answers
-**"Sign in to confirm you're not a bot"** for every client — yt-dlp, InnerTube,
-public frontends alike. It is not a bug in the bot: YouTube wants an
-account-backed session from IPs it doesn't trust. The bot now knows this and
-tells you so.
-
-**The fix is one message.** In a browser, sign in to YouTube, export cookies
-with the "Get cookies.txt LOCALLY" extension, then:
-
-```sh
-base64 -w0 cookies.txt        # macOS: base64 -i cookies.txt
-```
-
-DM the bot (owner only, never in a group):
-
-```
-.play cookie <paste that text>
-```
-
-Only **Google/YouTube cookies** are kept: a browser export also contains
-whatever else that browser is signed in to (dashboards, payment, captcha), and
-none of that is stored, written to the cookie file, or sent anywhere. It is
-validated (a visitor-only export with no `SID`/`HSID` is rejected with an
-explanation), stored through `utils/persist.js` — so in MongoDB when
-`MONGODB_URI` is set, surviving redeploys — and written to a `cookies.txt` that
-yt-dlp is given via `--cookies` and InnerTube via its session. Cookie values are
-never echoed back or logged.
-
-- `.play cookie` — state: how many cookies, signed-in or visitor export, source, age
-- `.play cookie clear` — remove them
-
-Hosts can set the same thing without chat instead:
-`YT_COOKIES_B64` (base64), `YT_COOKIES` (the file contents), `YT_COOKIE` (a
-`SID=…; HSID=…` header), or `YT_COOKIES_FILE` (a path).
-
-Cookies expire after a few months; when `.play` starts blocking again,
-re-export and resend.
-
-### What else changed for this
-
-- **Client ladder.** A bot block is per-client as well as per-IP, so yt-dlp now
-  walks `tv_simply,tv` → `android_vr` → `ios` → `mweb,web_safari` →
-  `default,-web,-web_safari` → its own defaults (or, with cookies,
-  defaults → `web_safari,web,mweb` → `tv_simply,tv`) instead of repeating one
-  refused request. With cookies, no PO-token attempt is made — yt-dlp refuses
-  that combination.
-- **No repeated pain.** A client group refused in the last 10 minutes is
-  skipped for subsequent attempts, so the second yt-dlp pass doesn't re-hammer
-  YouTube, and the user still sees the original reason.
-- **InnerTube** asks the web clients first when cookies exist (they're the ones
-  that use a session), and a null player response now reports "YouTube's player
-  data was incomplete (this client is being throttled)" instead of the
-  meaningless `Cannot read properties of null (reading 'as')`.
 
 ## Welcome verification
 
