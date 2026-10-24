@@ -24,10 +24,26 @@ function isOwnerJid(jid) {
   return false;
 }
 
-// Checks both the direct sender and, in groups, the participant field.
+// Checks both the direct sender and, in groups, the participant field
+// (including Baileys v7 alt/PN fields when the primary JID is an @lid).
 function isOwnerMessage(msg) {
-  const participant = msg.key.participant || msg.key.remoteJid;
-  return isOwnerJid(participant);
+  const isGroup = String(msg?.key?.remoteJid || "").endsWith("@g.us");
+  const candidates = isGroup
+    ? [
+        msg?.key?.participant,
+        msg?.key?.participantAlt,
+        msg?.key?.participantPn,
+        msg?.participant,
+        msg?.participantPn,
+      ]
+    : [
+        msg?.key?.remoteJid,
+        msg?.key?.remoteJidAlt,
+        msg?.key?.participant,
+        msg?.key?.participantAlt,
+        msg?.key?.participantPn,
+      ];
+  return candidates.some((jid) => isOwnerJid(jid));
 }
 
 module.exports = { isOwnerJid, isOwnerMessage };
