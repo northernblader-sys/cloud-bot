@@ -21,7 +21,7 @@ const { AUTH_DIR } = require("./utils/dataDir");
 const mongo = require("./utils/mongo");
 const persist = require("./utils/persist");
 const { loadAuth } = require("./utils/authLoader");
-const { getCachedMetadataOnly, invalidateGroupMetadata } = require("./utils/groupPermissions");
+const { getCachedMetadata, invalidateGroupMetadata } = require("./utils/groupPermissions");
 
 // ── Health endpoint ────────────────────────────────────────────────
 // Lets hosts that need an open HTTP port (Render web service, etc.) run the
@@ -65,7 +65,8 @@ async function startBot() {
 
   const silentLogger = pino({ level: "silent" });
 
-  const sock = makeWASocket({
+  let sock;
+  sock = makeWASocket({
     version,
     auth: {
       creds: state.creds,
@@ -83,7 +84,9 @@ async function startBot() {
     browser: Browsers.ubuntu("Chrome"),
     // Serve group info from our own cache when sending to groups, instead of
     // WhatsApp being asked for it on every send (rate-limit friendly).
-    cachedGroupMetadata: getCachedMetadataOnly,
+    // Cache misses use our shared metadata lookup so group sends don't pay
+    // for an uncached WhatsApp lookup on every reply.
+    cachedGroupMetadata: (groupJid) => getCachedMetadata(sock, groupJid),
     markOnlineOnConnect: true,
     keepAliveIntervalMs: 25_000,
     // The actual "60 second timer": without this Baileys falls back to a
@@ -165,17 +168,22 @@ async function startBot() {
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
 
-    // A batch can hold several messages; handle all of them, not just the first.
-    for (const msg of messages) {
-      if (!msg.message || msg.key.fromMe) continue;
-      if (msg.key.remoteJid === "status@broadcast") continue;
+    // A batch can hold several messages. Process independently instead of
+    // waiting for one slow command/API call before even starting the next —
+    // this is especially important for busy groups where Baileys batches
+    // incoming messages together.
+    await Promise.all(
+      messages.map(async (msg) => {
+        if (!msg.message || msg.key.fromMe) return;
+        if (msg.key.remoteJid === "status@broadcast") return;
 
-      try {
-        await handleMessage(sock, msg);
-      } catch (err) {
-        console.error("Error handling message:", err);
-      }
-    }
+        try {
+          await handleMessage(sock, msg);
+        } catch (err) {
+          console.error("Error handling message:", err);
+        }
+      })
+    );
   });
 
   // Keep the cached group info (admin list, members) fresh when it changes.

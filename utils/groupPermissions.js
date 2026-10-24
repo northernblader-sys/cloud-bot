@@ -9,6 +9,8 @@
 
 const METADATA_TTL_MS = 60_000;
 const metaCache = new Map(); // groupJid -> { at, data }
+const metadataRequests = new Map(); // groupJid -> in-flight groupMetadata promise
+const metadataGeneration = new Map(); // prevents invalidated lookups restoring stale data
 
 // "1234:5@s.whatsapp.net" -> "1234@s.whatsapp.net"
 function normJid(jid) {
@@ -44,20 +46,38 @@ function intersects(a, b) {
 async function getGroupMetadata(sock, groupJid, { fresh = false } = {}) {
   const hit = metaCache.get(groupJid);
   if (!fresh && hit && Date.now() - hit.at < METADATA_TTL_MS) return hit.data;
-  const data = await sock.groupMetadata(groupJid);
-  metaCache.set(groupJid, { at: Date.now(), data });
-  return data;
+
+  // Baileys may ask for metadata from several sends at once (e.g. a burst of
+  // group replies). Share one WhatsApp lookup and cache it for subsequent
+  // sends instead of serially repeating the same network round trip.
+  if (!fresh && metadataRequests.has(groupJid)) return metadataRequests.get(groupJid);
+
+  const generation = metadataGeneration.get(groupJid) || 0;
+  const request = Promise.resolve().then(() => sock.groupMetadata(groupJid));
+  if (!fresh) metadataRequests.set(groupJid, request);
+  try {
+    const data = await request;
+    if ((metadataGeneration.get(groupJid) || 0) === generation) {
+      metaCache.set(groupJid, { at: Date.now(), data });
+    }
+    return data;
+  } finally {
+    if (metadataRequests.get(groupJid) === request) metadataRequests.delete(groupJid);
+  }
 }
 
-// Used for Baileys' `cachedGroupMetadata` socket option, so sending to a group
-// doesn't trigger a metadata fetch every time.
-async function getCachedMetadataOnly(groupJid) {
-  const hit = metaCache.get(groupJid);
-  return hit && Date.now() - hit.at < METADATA_TTL_MS ? hit.data : undefined;
+// Baileys calls `cachedGroupMetadata` while encrypting group sends. Returning
+// undefined on a cache miss makes Baileys fetch metadata itself without
+// populating this cache, which can add a WhatsApp round trip to every reply.
+// Route misses through our shared, TTL-cached lookup instead.
+async function getCachedMetadata(sock, groupJid) {
+  return getGroupMetadata(sock, groupJid);
 }
 
 function invalidateGroupMetadata(groupJid) {
   metaCache.delete(groupJid);
+  metadataRequests.delete(groupJid);
+  metadataGeneration.set(groupJid, (metadataGeneration.get(groupJid) || 0) + 1);
 }
 
 function findParticipant(metadata, ...jids) {
@@ -91,7 +111,7 @@ module.exports = {
   intersects,
   botAliases,
   getGroupMetadata,
-  getCachedMetadataOnly,
+  getCachedMetadata,
   invalidateGroupMetadata,
   findParticipant,
   isParticipantAdmin,
