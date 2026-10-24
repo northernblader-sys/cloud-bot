@@ -3,8 +3,7 @@
 // media servers itself, so a datacenter IP can't trigger YouTube's bot check.
 //
 //   1. search   yt-search (a plain search-results lookup, no login needed)
-//   2. download EliteProTech -> Yupra -> Okatsu -> Keith, first one that
-//               really returns audio bytes wins
+//   2. download EliteProTech (the only source, no backups)
 //   3. send     converted to MP3 with ffmpeg when available
 //
 // None of these APIs need a key or credentials.
@@ -39,7 +38,7 @@ const API_HEADERS = { "User-Agent": BROWSER_UA, Accept: "application/json, text/
 
 // ── download sources ───────────────────────────────────────────────
 // Each source takes a YouTube URL and resolves to { download, title?, thumbnail? }.
-// Order matches Knightbot-MD's `.song` chain, with `.play`'s Keith API last.
+// There is only one source now; no backup sources are configured.
 async function getJson(url) {
   const res = await axios.get(url, { timeout: API_TIMEOUT_MS, headers: API_HEADERS });
   return res.data;
@@ -50,50 +49,14 @@ const SOURCES = [
     name: "EliteProTech",
     async resolve(youtubeUrl) {
       const data = await getJson(
-        `https://eliteprotech-apis.zone.id/ytdown?url=${encodeURIComponent(youtubeUrl)}&format=mp3`
+        `https://eliteprotech-apis.zone.id/download/ytmp3?url=${encodeURIComponent(youtubeUrl)}`
       );
-      if (data?.success && data?.downloadURL) {
-        return { download: data.downloadURL, title: data.title };
-      }
-      throw new Error("returned no download link");
-    },
-  },
-  {
-    name: "Yupra",
-    async resolve(youtubeUrl) {
-      const data = await getJson(
-        `https://api.yupra.my.id/api/downloader/ytmp3?url=${encodeURIComponent(youtubeUrl)}`
-      );
-      if (data?.success && data?.data?.download_url) {
+      if (data?.status && data?.download?.downloadUrl) {
         return {
-          download: data.data.download_url,
-          title: data.data.title,
-          thumbnail: data.data.thumbnail,
+          download: data.download.downloadUrl,
+          title: data.download.title,
+          thumbnail: data.download.thumbnail,
         };
-      }
-      throw new Error("returned no download link");
-    },
-  },
-  {
-    name: "Okatsu",
-    async resolve(youtubeUrl) {
-      const data = await getJson(
-        `https://okatsu-rolezapiiz.vercel.app/downloader/ytmp3?url=${encodeURIComponent(youtubeUrl)}`
-      );
-      if (data?.dl) {
-        return { download: data.dl, title: data.title, thumbnail: data.thumb };
-      }
-      throw new Error("returned no download link");
-    },
-  },
-  {
-    name: "Keith",
-    async resolve(youtubeUrl) {
-      const data = await getJson(
-        `https://apis-keith.vercel.app/download/dlmp3?url=${encodeURIComponent(youtubeUrl)}`
-      );
-      if (data?.status && data?.result?.downloadUrl) {
-        return { download: data.result.downloadUrl, title: data.result.title };
       }
       throw new Error("returned no download link");
     },
@@ -331,7 +294,7 @@ async function downloadAudioSource(youtubeUrl, filePath, sources = SOURCES) {
   }
 
   const failure = new Error(
-    "every audio source refused this track:\n" +
+    "the audio source refused this track:\n" +
       stages.map((entry) => `• ${entry.stage}: ${entry.error}`).join("\n")
   );
   failure.code = "DOWNLOAD_FAILED";
