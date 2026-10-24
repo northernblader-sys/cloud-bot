@@ -37,6 +37,7 @@ const {
   downloadFacebook,
   downloadAuto,
 } = require("../commands/downloaders/media");
+const { downloadTulsi } = require("../commands/downloaders/tulsi");
 const { toggleSetting } = require("../commands/group/settings");
 const { groupGuard } = require("../middleware/groupGuard");
 const { checkVerificationReply } = require("../middleware/joinVerification");
@@ -370,6 +371,12 @@ async function handleMessage(sock, msg) {
     case "dl":
     case "download": {
       const error = await downloadAuto(sock, msg, argText);
+      if (error) await sock.sendMessage(from, { text: error }, { quoted: msg });
+      break;
+    }
+
+    case "tulsi": {
+      const error = await downloadTulsi(sock, msg, argText);
       if (error) await sock.sendMessage(from, { text: error }, { quoted: msg });
       break;
     }

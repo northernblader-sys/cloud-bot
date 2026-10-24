@@ -82,6 +82,8 @@ commands, or answers it conversationally.
 | `.pinterest <url>` | Download a Pinterest image/video/gif |
 | `.fb <url>` | Download a Facebook video/photo |
 | `.dl <url>` | Auto-detect the platform and download |
+| `.tulsi mp3 <url>` | Audio extracted via the Tulsi API, sent as an MP3 audio message |
+| `.tulsi mp4 <url>` | 720p MP4 video via the Tulsi API, sent as a video message |
 
 `.play` searches YouTube with the `yt-search` package (a plain search-results
 lookup, no login), then asks public downloader APIs for the audio. The bot
