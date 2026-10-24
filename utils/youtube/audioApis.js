@@ -20,13 +20,22 @@ const { downloadUrlToFile } = require("./innertube");
 
 const DEFAULT_PIPED = [
   "https://pipedapi.kavin.rocks",
-  "https://pipedapi.adminforge.de",
-  "https://api.piped.private.coffee",
+  "https://pipedapi.leptons.xyz",
+  "https://pipedapi.nosebs.ru",
 ];
 
 const DEFAULT_INVIDIOUS = [
   "https://inv.nadeko.net",
-  "https://invidious.nerdvpn.de",
+  "https://invidious.jing.rocks",
+  "https://invidious.privacyredirect.com",
+];
+
+const DEFAULT_TEMPLATES = [
+  "https://api-faa.my.id/faa/ytmp3?url=https://www.youtube.com/watch?v={id}",
+  "https://api.siputzx.my.id/api/d/ytmp3?url=https://www.youtube.com/watch?v={id}",
+  "https://api.vreden.my.id/api/ytmp3?url=https://www.youtube.com/watch?v={id}",
+  "https://api.agatz.xyz/api/ytmp3?url=https://www.youtube.com/watch?v={id}",
+  "https://api.ryzendesu.vip/api/downloader/ytmp3?url=https://www.youtube.com/watch?v={id}",
 ];
 
 const REQUEST_TIMEOUT_MS = 15000;
@@ -208,6 +217,48 @@ async function fromInvidious(videoId, instance) {
   };
 }
 
+// ── OceanSaver (loader.to) ─────────────────────────────────────────
+// Async job endpoint used by desktop/bot downloaders: initiates an MP3
+// render on OceanSaver's worker pool, then polls progress until download_url.
+async function fromOceanSaver(videoId, instance = "https://p.oceansaver.in") {
+  const base = instance.replace(/\/+$/, "");
+  const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
+  const startUrl =
+    `${base}/ajax/download.php?format=mp3` +
+    `&url=${encodeURIComponent(ytUrl)}` +
+    `&api=dfcb6d76f2f6a9894gjkege8a4ab232222`;
+
+  const data = await getJson(startUrl, {
+    headers: { referer: "https://ddownr.com/" },
+  });
+  if (!data?.success || !data?.id) {
+    throw new Error(data?.message || "oceansaver did not start a job");
+  }
+
+  const progressUrl = `${base}/ajax/progress.php?id=${encodeURIComponent(data.id)}`;
+  for (let i = 0; i < 12; i += 1) {
+    await new Promise((r) => setTimeout(r, 1500));
+    const prog = await getJson(progressUrl, {
+      headers: { referer: "https://ddownr.com/" },
+    }).catch(() => null);
+    if (prog?.success === 1 && prog?.download_url) {
+      return {
+        provider: "oceansaver",
+        url: prog.download_url,
+        mimeType: "audio/mpeg",
+        title: data.title || data.info?.title || "",
+        author: "",
+        durationSec: 0,
+      };
+    }
+    if (prog && prog.success === -1) {
+      throw new Error(prog.text || "oceansaver conversion failed");
+    }
+  }
+
+  throw new Error("oceansaver timed out waiting for download URL");
+}
+
 // ── cobalt ─────────────────────────────────────────────────────────
 // POST /  { url, downloadMode: "audio" }  ->  { status, url }
 async function fromCobalt(videoId, instance) {
@@ -301,7 +352,11 @@ async function fromTemplate(videoId, template) {
 
   try {
     const response = await fetch(url, {
-      headers: { "user-agent": "Mozilla/5.0", accept: "application/json, text/plain, */*" },
+      headers: {
+        "user-agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        accept: "application/json, text/plain, */*",
+      },
       signal: controller.signal,
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -342,12 +397,19 @@ function buildProviders() {
   const cobalt = envList("COBALT_INSTANCES") || (process.env.COBALT_API_URL ? [process.env.COBALT_API_URL] : []);
 
   const named = {
+    oceansaver: () => [() => ({ kind: "oceansaver", instance: "https://p.oceansaver.in" })],
     piped: () => piped.map((instance) => () => ({ kind: "piped", instance })),
     invidious: () => invidious.map((instance) => () => ({ kind: "invidious", instance })),
     cobalt: () => cobalt.map((instance) => () => ({ kind: "cobalt", instance })),
   };
 
-  const requested = overrides || ["piped", "invidious", "cobalt"];
+  const requested = overrides || [
+    "oceansaver",
+    ...DEFAULT_TEMPLATES,
+    "piped",
+    "invidious",
+    "cobalt",
+  ];
   const providers = [];
 
   for (const entry of requested) {
@@ -366,6 +428,7 @@ function buildProviders() {
 }
 
 async function resolveWithProvider(candidate, videoId) {
+  if (candidate.kind === "oceansaver") return fromOceanSaver(videoId, candidate.instance);
   if (candidate.kind === "piped") return fromPiped(videoId, candidate.instance);
   if (candidate.kind === "invidious") return fromInvidious(videoId, candidate.instance);
   if (candidate.kind === "cobalt") return fromCobalt(videoId, candidate.instance);

@@ -528,10 +528,12 @@ async function fetchAudioWithYtdlp(videoId, filePath, options = {}) {
 
     const js = ["--js-runtimes", `node:${process.execPath}`];
 
-    // Refloow's recipe first (EXTRACTOR_ARGS), then the client ladder. A
+    // Refloow's recipe first (EXTRACTOR_ARGS), then the first ladder client. A
     // "Sign in to confirm you're not a bot" is the normal failure here, so the
-    // run has to be able to change client rather than give up.
-    const variants = [EXTRACTOR_ARGS, ...clientLadder(Boolean(cookiePath))];
+    // run has to be able to change client rather than give up, while leaving
+    // the full ladder walk to the "arroxy" pass.
+    const ladder = clientLadder(Boolean(cookiePath));
+    const variants = [EXTRACTOR_ARGS, ladder[0]];
 
     attempts = variants.map((extractorArgs, index) => ({
       label: `basic-${index + 1} (${shortLabel(extractorArgs)})`,
@@ -547,6 +549,7 @@ async function fetchAudioWithYtdlp(videoId, filePath, options = {}) {
 
   const failures = [];
   let produced = null;
+  let botBlockCount = 0;
 
   try {
     for (const attempt of attempts) {
@@ -583,7 +586,17 @@ async function fetchAudioWithYtdlp(videoId, filePath, options = {}) {
         });
 
         if (classification.kind === "botBlock") {
+          botBlockCount += 1;
           rememberBlocked(extractorArgs, cookieState, err.message);
+          // Once two distinct client groups are bot-blocked on this IP,
+          // YouTube is refusing the IP/session across clients — memoise the
+          // rest of this pass and move on to non-YouTube fallbacks.
+          if (botBlockCount >= 2) {
+            for (const rest of attempts) {
+              rememberBlocked(extractorArgsOf(rest.args), cookieState, err.message);
+            }
+            break;
+          }
         }
 
         if (attempt.stopKinds?.includes(classification.kind)) break;
@@ -669,17 +682,201 @@ function isLikelyAudioPath(file) {
 
 async function readInfoJson(workId) {
   const files = await listWorkFiles(workId);
-  const infoFile = files.find((file) => /\.info\.json$/i.test(file));
-  if (!infoFile) return {};
+  const infoFiles = files.filter((file) => /\.info\.json$/i.test(file));
+  for (const infoFile of infoFiles) {
+    try {
+      const info = JSON.parse(await readFile(infoFile, "utf8"));
+      if (info && info._type !== "playlist" && (info.title || info.duration)) {
+        return {
+          title: info.title || "",
+          author: info.uploader || info.channel || info.artist || "",
+          durationSec: Math.round(Number(info.duration) || 0),
+        };
+      }
+    } catch {
+      // try next
+    }
+  }
+  return {};
+}
+
+/**
+ * Build clean search queries for non-YouTube audio sources (e.g. SoundCloud)
+ * from a YouTube search result `{ title, author, query }`.
+ */
+function cleanSearchQuery(meta = {}) {
+  const queries = [];
+  const rawTitle = String(meta.title || "").trim();
+  const rawAuthor = String(meta.author || "").trim();
+  const rawQuery = String(meta.query || "").trim();
+
+  const isBareId = (s) => /^[-_0-9A-Za-z]{11}$/.test(s);
+  const isUrl = (s) => /^https?:\/\/|(?:youtube\.com|youtu\.be)\//i.test(s);
+
+  const cleanTitle = rawTitle
+    .replace(
+      /\s*[\(\[](?:official\s*(?:music\s*)?(?:video|audio|lyric\s*video|visualizer|hd|4k)|lyrics?|lyric\s*video|audio|video\s*oficial|visualizer|hd|4k|hq|full\s*audio|m\/v|mv|explicit|clean)[\)\]]/gi,
+      ""
+    )
+    .replace(/\s*\|\s*.*$/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const cleanAuthor = rawAuthor
+    .replace(/\s*-\s*Topic$/i, "")
+    .replace(/VEVO$/i, "")
+    .replace(/\s*Official$/i, "")
+    .trim();
+
+  if (cleanTitle && !isBareId(cleanTitle) && !isUrl(cleanTitle)) {
+    if (
+      cleanAuthor &&
+      !cleanTitle.toLowerCase().includes(cleanAuthor.toLowerCase())
+    ) {
+      queries.push(`${cleanAuthor} - ${cleanTitle}`);
+    }
+    queries.push(cleanTitle);
+  }
+
+  if (rawQuery && !isBareId(rawQuery) && !isUrl(rawQuery)) {
+    if (!queries.some((q) => q.toLowerCase() === rawQuery.toLowerCase())) {
+      queries.push(rawQuery);
+    }
+  }
+
+  return queries;
+}
+
+/**
+ * Download audio for a track by searching SoundCloud via yt-dlp (`scsearch5:`).
+ *
+ * SoundCloud does not block datacenter IPs with BotGuard or require cookies,
+ * so when YouTube refuses every client on a cloud host, this still delivers
+ * the song in a few seconds.
+ */
+async function fetchAudioWithYtdlpSearch(meta, filePath, options = {}) {
+  const { maxBytes = 300 * 1024 * 1024 } = options;
+  const queries =
+    typeof meta === "string" ? cleanSearchQuery({ query: meta }) : cleanSearchQuery(meta);
+  if (!queries.length) {
+    throw new Error("no search query available for SoundCloud fallback");
+  }
+
+  const binary = await resolveYtdlp();
+  await mkdir(TEMP_DIR, { recursive: true });
+  const workId = randomUUID();
+  const template = join(TEMP_DIR, `ytdlp-sc-${workId}.%(ext)s`);
+
+  const targetDuration = Number(meta?.durationSec) || 0;
+  // Skip 30-second SoundCloud Go+ preview snippets unless the track itself is short.
+  const minDuration = targetDuration > 0 && targetDuration <= 45 ? 5 : 40;
+  const maxDuration = targetDuration > 0 ? Math.max(900, targetDuration * 2) : 900;
+
+  const attempts = [];
+  for (const q of queries.slice(0, 2)) {
+    attempts.push({
+      label: `scsearch5:${q}`,
+      args: [
+        `scsearch5:${q}`,
+        "-f",
+        "bestaudio/best",
+        "-o",
+        template,
+        "--ignore-config",
+        "--no-warnings",
+        "--no-progress",
+        "--no-part",
+        "--write-info-json",
+        "--match-filter",
+        `duration >= ${minDuration} & duration <= ${maxDuration}`,
+        "--max-downloads",
+        "1",
+        "--socket-timeout",
+        "20",
+        "--retries",
+        "3",
+      ],
+    });
+  }
+
+  // Fallback without duration filter in case the track is <40s or metadata omits duration.
+  attempts.push({
+    label: `scsearch1:${queries[0]}`,
+    args: [
+      `scsearch1:${queries[0]}`,
+      "-f",
+      "bestaudio/best",
+      "-o",
+      template,
+      "--ignore-config",
+      "--no-warnings",
+      "--no-progress",
+      "--no-part",
+      "--write-info-json",
+      "--socket-timeout",
+      "20",
+      "--retries",
+      "3",
+    ],
+  });
+
+  let produced = null;
+  let lastError = null;
+
   try {
-    const info = JSON.parse(await readFile(infoFile, "utf8"));
+    for (const attempt of attempts) {
+      for (const leftover of await listWorkFiles(workId)) {
+        await rm(leftover, { force: true }).catch(() => {});
+      }
+
+      try {
+        await runYtdlp(binary, attempt.args);
+      } catch (err) {
+        // Exit code 101 is yt-dlp's normal status when --max-downloads 1 is reached
+        // right after downloading the first matching track.
+        if (err.exitCode !== 101) {
+          lastError = err;
+        }
+      }
+
+      produced = await findOutput(workId);
+      if (produced) {
+        const size = await stat(produced).then((s) => s.size).catch(() => 0);
+        const head = size ? (await readFile(produced)).subarray(0, 64) : Buffer.alloc(0);
+        if (size && isLikelyAudio(head)) break;
+        produced = null;
+      }
+    }
+
+    if (!produced) {
+      throw lastError || new Error("SoundCloud search produced no matching audio");
+    }
+
+    const size = await stat(produced).then((s) => s.size);
+    if (size > maxBytes) {
+      const error = new Error(
+        `audio is ${(size / 1048576).toFixed(1)} MB, over the ${Math.round(maxBytes / 1048576)} MB limit`
+      );
+      error.code = "TOO_LARGE";
+      throw error;
+    }
+
+    await rm(filePath, { force: true }).catch(() => {});
+    await rename(produced, filePath);
+
+    const scMeta = await readInfoJson(workId);
     return {
-      title: info.title || "",
-      author: info.uploader || info.channel || "",
-      durationSec: Math.round(Number(info.duration) || 0),
+      source: "yt-dlp (soundcloud)",
+      mimeType: mimeForExtension(produced),
+      bytes: size,
+      title: meta?.title || scMeta.title || "",
+      author: meta?.author || scMeta.author || "",
+      durationSec: scMeta.durationSec || targetDuration || 0,
     };
-  } catch {
-    return {};
+  } finally {
+    for (const leftover of await listWorkFiles(workId)) {
+      await rm(leftover, { force: true }).catch(() => {});
+    }
   }
 }
 
@@ -693,6 +890,8 @@ function hasYtdlp() {
 
 module.exports = {
   fetchAudioWithYtdlp,
+  fetchAudioWithYtdlpSearch,
+  cleanSearchQuery,
   arroxyLadder,
   classifyYtdlpError,
   getVisitorData,

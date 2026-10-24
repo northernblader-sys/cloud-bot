@@ -12,7 +12,11 @@ const ffmpegBinary = require2("ffmpeg-static");
 const { searchYoutube } = require("../../utils/y2mate/search");
 const { fetchAudioToFile, cleanupFile, TEMP_DIR } = require("../../utils/youtube/innertube");
 const { fetchAudioFromApis, isLikelyAudio } = require("../../utils/youtube/audioApis");
-const { fetchAudioWithYtdlp, hasYtdlp } = require("../../utils/youtube/ytdlp");
+const {
+  fetchAudioWithYtdlp,
+  fetchAudioWithYtdlpSearch,
+  hasYtdlp,
+} = require("../../utils/youtube/ytdlp");
 const { downloadY2mateAudioToFile } = require("../../utils/y2mate/audio");
 const ytSession = require("../../utils/youtube/session");
 const { isOwnerMessage } = require("../../utils/owner");
@@ -130,12 +134,14 @@ async function fetchThumbnailBuffer(url) {
 }
 
 // Source order, best first:
-//   1. YouTube InnerTube  — highest quality, one request, most likely to work
-//   2. public APIs        — Piped / Invidious / cobalt / a custom endpoint
-//   3. y2mate             — HTML scraper, last resort
+//   1. yt-dlp (YouTube)   — basic + arroxy ladder
+//   2. YouTube InnerTube  — highest quality, one request
+//   3. yt-dlp (SoundCloud)— bypasses YouTube datacenter IP blocks completely
+//   4. public APIs        — OceanSaver / api-faa / Piped / Invidious / cobalt
+//   5. y2mate             — HTML scraper, last resort
 // Each stage only wins if it actually produced audio bytes, and each failure
 // is collected so the error we surface says which stage died and why.
-async function downloadAudioSource(videoId, filePath) {
+async function downloadAudioSource(videoId, filePath, meta = {}) {
   const stages = [];
 
   // Reasons worth surfacing verbatim: they say what to configure.
@@ -143,6 +149,8 @@ async function downloadAudioSource(videoId, filePath) {
     (error.failures || [])
       .map((failure) => failure.error || failure.message || String(failure))
       .filter(Boolean);
+
+  const canRunYtdlp = hasYtdlp() || process.env.YTDLP_AUTODOWNLOAD !== "0";
 
   // yt-dlp first when it's already installed: it follows YouTube's anti-bot
   // changes (PO tokens, nsig challenges) faster than any library can, and it
@@ -152,7 +160,7 @@ async function downloadAudioSource(videoId, filePath) {
   // Two yt-dlp passes: the plain desktop-app recipe, then Arroxy's retry
   // ladder (PO token if configured → clients that don't demand one → yt-dlp's
   // own defaults), which is what rescues videos the first pass can't reach.
-  if (hasYtdlp() || process.env.YTDLP_AUTODOWNLOAD !== "0") {
+  if (videoId && canRunYtdlp) {
     const strategies = [
       { strategy: "basic", label: "yt-dlp" },
       { strategy: "arroxy", label: "yt-dlp (arroxy)" },
@@ -179,24 +187,45 @@ async function downloadAudioSource(videoId, filePath) {
     }
   }
 
-  try {
-    return await fetchAudioToFile(videoId, filePath, { maxBytes: MAX_SOURCE_BYTES });
-  } catch (error) {
-    stages.push({ stage: "YouTube", error, reasons: reasonsOf(error) });
-    console.warn("[play] InnerTube failed, trying public audio APIs");
+  if (videoId) {
+    try {
+      return await fetchAudioToFile(videoId, filePath, { maxBytes: MAX_SOURCE_BYTES });
+    } catch (error) {
+      stages.push({ stage: "YouTube", error, reasons: reasonsOf(error) });
+      console.warn("[play] InnerTube failed, trying SoundCloud / public audio APIs");
+    }
   }
 
-  try {
-    return await fetchAudioFromApis(videoId, filePath, { maxBytes: MAX_SOURCE_BYTES });
-  } catch (error) {
-    stages.push({ stage: "public APIs", error, reasons: reasonsOf(error) });
-    console.warn("[play] public audio APIs failed, trying y2mate");
+  // When YouTube blocks the host's datacenter IP, yt-dlp can still fetch the
+  // track straight from SoundCloud (`scsearch5:`) without cookies or BotGuard.
+  if (
+    canRunYtdlp &&
+    typeof fetchAudioWithYtdlpSearch === "function" &&
+    (meta.title || meta.query)
+  ) {
+    try {
+      return await fetchAudioWithYtdlpSearch(meta, filePath, {
+        maxBytes: MAX_SOURCE_BYTES,
+      });
+    } catch (error) {
+      stages.push({ stage: "SoundCloud", error, reasons: reasonsOf(error) });
+      console.warn(`[play] SoundCloud (yt-dlp) failed: ${error.message}`);
+    }
   }
 
-  try {
-    return await downloadY2mateAudioToFile(videoId, filePath);
-  } catch (error) {
-    stages.push({ stage: "y2mate", error, reasons: reasonsOf(error) });
+  if (videoId) {
+    try {
+      return await fetchAudioFromApis(videoId, filePath, { maxBytes: MAX_SOURCE_BYTES });
+    } catch (error) {
+      stages.push({ stage: "public APIs", error, reasons: reasonsOf(error) });
+      console.warn("[play] public audio APIs failed, trying y2mate");
+    }
+
+    try {
+      return await downloadY2mateAudioToFile(videoId, filePath);
+    } catch (error) {
+      stages.push({ stage: "y2mate", error, reasons: reasonsOf(error) });
+    }
   }
 
   const combined = new Error(
@@ -350,7 +379,20 @@ async function playSong(sock, msg, query) {
   try {
     video = await searchYoutube(query);
   } catch (err) {
-    return { text: `⚠️ Couldn't find that song. ${err.message}` };
+    if (
+      typeof fetchAudioWithYtdlpSearch === "function" &&
+      (hasYtdlp() || process.env.YTDLP_AUTODOWNLOAD !== "0")
+    ) {
+      video = {
+        id: null,
+        title: String(query).trim(),
+        author: "",
+        durationSec: 0,
+        thumbnail: null,
+      };
+    } else {
+      return { text: `⚠️ Couldn't find that song. ${err.message}` };
+    }
   }
 
   // Fetch the cover art once, reuse it for the "found" message and for the
@@ -376,7 +418,12 @@ async function playSong(sock, msg, query) {
   try {
     let source;
     try {
-      source = await downloadAudioSource(video.id, sourcePath);
+      source = await downloadAudioSource(video.id, sourcePath, {
+        title: video.title,
+        author: video.author,
+        durationSec: video.durationSec,
+        query,
+      });
     } catch (err) {
       console.error("[play] download failed:", err.message);
 

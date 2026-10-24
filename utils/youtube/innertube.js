@@ -44,10 +44,16 @@ const DEFAULT_CLIENT_ORDER = [
 const CLIENT_INFO_TIMEOUT_MS = 25000;
 const DOWNLOAD_TIMEOUT_MS = 5 * 60 * 1000;
 const CLIENT_TTL_MS = 6 * 60 * 60 * 1000;
+const BLOCK_MEMO_MS = 10 * 60 * 1000;
 const DEFAULT_MAX_BYTES = 300 * 1024 * 1024;
+
+// Only web-based clients understand browser cookies; handing web cookies to
+// ANDROID_VR / iOS / VISIONOS causes YouTube to reject the request.
+const COOKIE_CAPABLE_CLIENTS = new Set(["WEB", "MWEB", "WEB_EMBEDDED_PLAYER", "TVHTML5"]);
 
 let youtubeModulePromise;
 const clientPromises = new Map();
+const blockedClients = new Map();
 let preferredClient = null;
 let moduleOverride = null; // test seam: lets specs inject a fake youtubei.js
 
@@ -116,8 +122,8 @@ async function createClient(clientName) {
 
   const poToken = envValue("YT_PO_TOKEN");
   const visitorData = envValue("YT_VISITOR_DATA");
-  // Any of the cookie sources (env, saved from chat) work here.
-  const cookie = session.header();
+  // Any of the cookie sources (env, saved from chat) work here, for web clients.
+  const cookie = COOKIE_CAPABLE_CLIENTS.has(clientName) ? session.header() : null;
   if (poToken) options.po_token = poToken;
   if (visitorData) options.visitor_data = visitorData;
   if (cookie) options.cookie = cookie;
@@ -195,9 +201,17 @@ function cleanMediaUrl(url) {
   }
 }
 
-async function downloadStreamUrl(mediaUrl, filePath, { timeoutMs, maxBytes }) {
+async function downloadStreamUrl(mediaUrl, filePath, { timeoutMs = DOWNLOAD_TIMEOUT_MS, maxBytes } = {}) {
   if (!mediaUrl) throw new Error("YouTube gave no playable audio URL");
   const url = cleanMediaUrl(mediaUrl);
+
+  const isGoogleVideo = /googlevideo\.com|youtube\.com/i.test(url);
+  let originHeader = "https://www.youtube.com";
+  try {
+    if (!isGoogleVideo) originHeader = new URL(url).origin;
+  } catch {
+    // keep default
+  }
 
   const started = Date.now();
   const handle = await open(filePath, "w");
@@ -217,9 +231,12 @@ async function downloadStreamUrl(mediaUrl, filePath, { timeoutMs, maxBytes }) {
         response = await fetch(url, {
           signal: stall.signal,
           headers: {
+            "user-agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             accept: "*/*",
-            origin: "https://www.youtube.com",
-            referer: "https://www.youtube.com",
+            ...(isGoogleVideo
+              ? { origin: "https://www.youtube.com", referer: "https://www.youtube.com" }
+              : { referer: `${originHeader}/` }),
             "accept-encoding": "identity",
             range: `bytes=${offset}-${offset + CHUNK_BYTES - 1}`,
           },
@@ -390,8 +407,17 @@ async function fetchAudioToFile(videoId, filePath, options = {}) {
     : order;
 
   const failures = [];
+  const cookieState = session.header() || "";
+  let botBlockCount = 0;
 
   for (const clientName of attempts) {
+    const memoKey = `${clientName}|${cookieState}`;
+    const blocked = blockedClients.get(memoKey);
+    if (blocked && Date.now() - blocked.at < BLOCK_MEMO_MS) {
+      failures.push({ client: clientName, error: blocked.message });
+      continue;
+    }
+
     try {
       const result = await tryClient(clientName, videoId, filePath, maxBytes);
       preferredClient = clientName;
@@ -405,6 +431,20 @@ async function fetchAudioToFile(videoId, filePath, options = {}) {
           onAttempt(clientName, err, failures.length);
         } catch {
           /* status updates are best-effort */
+        }
+      }
+
+      if (/LOGIN_REQUIRED|confirm you.{0,3}re not a bot|bot check/i.test(err.message)) {
+        botBlockCount += 1;
+        blockedClients.set(memoKey, { at: Date.now(), message: err.message });
+        if (!moduleOverride && botBlockCount >= 2) {
+          for (const rest of attempts) {
+            blockedClients.set(`${rest}|${cookieState}`, {
+              at: Date.now(),
+              message: err.message,
+            });
+          }
+          break;
         }
       }
 
@@ -442,6 +482,7 @@ module.exports = {
   _setYoutubeModule: (mod) => {
     moduleOverride = mod;
     clientPromises.clear();
+    blockedClients.clear();
     preferredClient = null;
   },
   _getPreferredClient: () => preferredClient,
