@@ -6,6 +6,7 @@ auth_info/
 data/
 media/
 tmp/
+cache/
 *.log
 
 # Never commit API keys.

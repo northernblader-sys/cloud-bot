@@ -2,7 +2,7 @@ const { downloadMediaMessage } = require("@whiskeysockets/baileys");
 const gemini = require("../utils/gemini");
 const brain = require("../utils/cloudBrain");
 const { getQuotedMedia } = require("../utils/quotedMessage");
-const { playSong } = require("./downloaders/play");
+const { play } = require("./music");
 const { downloadAuto } = require("./downloaders/media");
 const { movieSearch } = require("./movie");
 const { animeSearch } = require("./anime");
@@ -281,10 +281,12 @@ async function cmdCloud(sock, msg, argText) {
   }
 
   // play_song needs to send its own "searching / found" status updates
-  // (it already does this internally), so call it directly here instead
-  // of through runTool.
+  // and the media file itself (it already does this internally), so call
+  // it directly here instead of through runTool — same convention as
+  // download_media below: it returns null when it already sent everything.
   if (name === "play_song") {
-    return playSong(sock, msg, args.query);
+    await play(sock, msg.key.remoteJid, msg, args.query || "");
+    return null;
   }
 
   // downloadAuto also sends its own message(s) on success (returns null),
