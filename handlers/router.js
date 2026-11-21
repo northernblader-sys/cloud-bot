@@ -28,7 +28,7 @@ const {
   setGroupName,
   setGroupDesc,
 } = require("../commands/group/moderation");
-const { playSong } = require("../commands/downloaders/play");
+const { play } = require("../commands/music");
 const { cmdCloud } = require("../commands/cloud");
 const {
   downloadTikTok,
@@ -318,14 +318,9 @@ async function handleMessage(sock, msg) {
     }
 
     case "play": {
-      const result = await playSong(sock, msg, argText);
-      // Usually { audio }, but very long tracks come back as { document }
-      // so WhatsApp doesn't reject an oversized inline upload.
-      if (result.audio || result.document) {
-        await sock.sendMessage(from, result, { quoted: msg });
-      } else {
-        await sock.sendMessage(from, { text: result.text || "⚠️ That didn't work." }, { quoted: msg });
-      }
+      // music.js streams its own progress messages and sends the media
+      // file itself (sock/from/msg direct), so there's no result to forward.
+      await play(sock, from, msg, argText);
       break;
     }
 

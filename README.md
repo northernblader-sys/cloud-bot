@@ -76,7 +76,8 @@ commands, or answers it conversationally.
 
 | Command | Description |
 |---|---|
-| `.play <song name or link>` | Search YouTube and send back the audio as MP3 |
+| `.play <song name>` | Search YouTube and send the audio as an inline Opus/OGG message |
+| `.play -v <song name>` | Same search, but send the video (MP4) instead |
 | `.tiktok <url>` | Download a TikTok video (or images) |
 | `.ig <url>` | Download an Instagram post/reel |
 | `.pinterest <url>` | Download a Pinterest image/video/gif |
@@ -86,33 +87,27 @@ commands, or answers it conversationally.
 | `.tulsi mp4 <url>` | 720p MP4 video via the Tulsi API, sent as a video message |
 
 `.play` searches YouTube with the `yt-search` package (a plain search-results
-lookup, no login), then asks public downloader APIs for the audio. The bot
-never contacts YouTube's media servers itself, so a datacenter IP can't trigger
-YouTube's "Sign in to confirm you're not a bot" check. The same approach is
-used by Knightbot-MD. None of the APIs need a key.
+lookup, no login), downloads the audio with the bundled `yt-dlp` binary from
+`youtube-dl-exec`, and re-muxes it with `ffmpeg-static` into mono 48 kHz Opus
+in an OGG container — the exact format WhatsApp inline-plays as an audio
+message (anything else shows up as a tap-to-open document). `.play -v <song>`
+sends the video as a 480p MP4 instead.
 
-Sources are tried in order, and one only wins if it really returns audio bytes
-(an HTML or JSON error page served with a 200 is rejected):
-
-1. **EliteProTech** — `eliteprotech-apis.zone.id/ytdown`
-2. **Yupra** — `api.yupra.my.id/api/downloader/ytmp3`
-3. **Okatsu** — `okatsu-rolezapiiz.vercel.app/downloader/ytmp3`
-4. **Keith** — `apis-keith.vercel.app/download/dlmp3`
-
-The winning file is streamed to a temp file, converted to MP3 with ffmpeg and
-sent as a WhatsApp audio message. If every source refuses, the reply lists one
-line per source with its real error.
+Both binaries ship inside their npm packages, so a plain `npm install` is
+enough — no apt, no pip, no Dockerfile changes. That's what makes it work on
+Render's default Node environment. Downloads are cached in `cache/music/`, so
+repeating the same query is instant until the next deploy (Render's disk is
+ephemeral; mount a Render Disk at `./cache` if you want the cache to survive
+redeploys).
 
 Notes:
 
-- Long tracks are re-encoded at a lower bitrate so the MP3 stays under
-  WhatsApp's ~16 MB media limit; anything still too large is sent as a playable
-  document instead of failing.
-- If ffmpeg isn't available the original audio is sent instead.
-- These are small third-party services. They can change or go down without
-  notice. If one stops working, edit its entry in the `SOURCES` list at the top
-  of `commands/downloaders/play.js` (each entry is one `resolve(youtubeUrl)`
-  function), or add a new one.
+- Tracks over 10 minutes are rejected up front (a 3-hour mix would stall the
+  bot).
+- `.play` with no query just prints usage.
+- The download path runs `yt-dlp` against YouTube directly, so if YouTube
+  starts showing a bot check to your server's IP, the error surfaces in the
+  chat ("Download failed...") rather than failing silently.
 
 `.tiktok`/`.ig`/`.pinterest`/`.fb` use tikwm.com and api-faa.my.id. Those are third-party scraper APIs, not official platform APIs — they can change or go down without notice. If one stops working, the fix is updating the relevant fetch function in `utils/downloaders/fetchers.js`.
 
