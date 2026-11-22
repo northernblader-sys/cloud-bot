@@ -26,6 +26,12 @@
  * older than `YT_DLP_MAX_AGE_HOURS` (default 24) is re-downloaded on
  * the next `npm install` or bot start; if the refresh fails, the
  * existing binary is kept — an outdated yt-dlp beats no yt-dlp.
+ *
+ * Outbound proxy: when `YT_DLP_PROXY` is set (e.g. `socks5h://user:pass@
+ * host:1080`), every yt-dlp call goes through it and WhatsApp traffic
+ * stays direct. This is the escape hatch for a flagged datacenter IP —
+ * see README "If the IP stays blocked" for endpoint options (WARP, a
+ * cheap VPS, a residential proxy service, a home exit node).
  */
 
 const fs = require("fs");
@@ -187,6 +193,16 @@ async function installYtDlp({
 }
 
 /**
+ * Outbound proxy for yt-dlp traffic only. Resolution order: per-call
+ * `opts.proxy` (tests / callers; "" disables), then `$YT_DLP_PROXY`.
+ * Returns "" when no proxy is configured — yt-dlp connects directly.
+ */
+function proxyArg(opts = {}) {
+  if (opts.proxy !== undefined) return String(opts.proxy || "");
+  return process.env.YT_DLP_PROXY || "";
+}
+
+/**
  * Run yt-dlp against a URL with youtube-dl-exec-compatible flags.
  * Resolves with stdout (JSON-parsed when it looks like JSON), rejects with
  * an Error carrying yt-dlp's stderr on failure.
@@ -208,7 +224,12 @@ function ytdlp(url, flags = {}, opts = {}) {
     );
   }
 
-  const args = [...toArgs(flags), "--", url];
+  const args = [...toArgs(flags)];
+  const proxy = proxyArg(opts);
+  if (proxy) {
+    args.push("--proxy", proxy);
+  }
+  args.push("--", url);
   const timeoutMs =
     opts.timeoutMs !== undefined
       ? opts.timeoutMs

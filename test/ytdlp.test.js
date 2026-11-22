@@ -285,3 +285,49 @@ test("ytdlp kills a hung binary at the timeout", async (t) => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("ytdlp injects --proxy from YT_DLP_PROXY; opts.proxy overrides and '' disables", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("fake binary uses a shebang");
+    return;
+  }
+  const dir = await mkdtemp(path.join(os.tmpdir(), "ytdlp-test-"));
+  const fake = path.join(dir, "proxy-yt-dlp");
+  writeFileSync(
+    fake,
+    "#!/usr/bin/env node\n" +
+      "const args = process.argv.slice(2);\n" +
+      "console.log(JSON.stringify({ args }));\n"
+  );
+  await chmod(fake, 0o755);
+
+  const before = process.env.YT_DLP_PROXY;
+  const proxyOf = (out) => {
+    const i = out.args.indexOf("--proxy");
+    return i === -1 ? null : out.args[i + 1];
+  };
+  try {
+    // No proxy configured -> no --proxy flag at all.
+    delete process.env.YT_DLP_PROXY;
+    const direct = await ytdlp("https://youtu.be/abc", {}, { bin: fake });
+    assert.equal(proxyOf(direct), null, "no --proxy when unset");
+
+    // Env var -> applied to every call (search and downloads share this runner).
+    process.env.YT_DLP_PROXY = "socks5h://user:pass@proxy.example:1080";
+    const viaEnv = await ytdlp("https://youtu.be/abc", {}, { bin: fake });
+    assert.equal(proxyOf(viaEnv), "socks5h://user:pass@proxy.example:1080");
+    assert.ok(viaEnv.args[viaEnv.args.length - 1] === "https://youtu.be/abc", "URL stays last");
+
+    // Per-call override wins over the env var.
+    const viaOpt = await ytdlp("https://youtu.be/abc", {}, { bin: fake, proxy: "http://other:8080" });
+    assert.equal(proxyOf(viaOpt), "http://other:8080");
+
+    // Empty per-call value disables the env-configured proxy.
+    const disabled = await ytdlp("https://youtu.be/abc", {}, { bin: fake, proxy: "" });
+    assert.equal(proxyOf(disabled), null, "opts.proxy '' disables the env proxy");
+  } finally {
+    if (before === undefined) delete process.env.YT_DLP_PROXY;
+    else process.env.YT_DLP_PROXY = before;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
