@@ -15,3 +15,6 @@ bin/
 openrouter.key
 *.key
 .env*
+
+# YouTube cookies for yt-dlp bot check — never commit these.
+cookies.txt
