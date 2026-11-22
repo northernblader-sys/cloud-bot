@@ -196,6 +196,33 @@ Notes:
 - Pick a proxy whose other users don't hammer YouTube — a shared VPN
   exit with abuse history is the same problem you're escaping.
 
+#### Rotating through several proxies
+
+`YT_DLP_PROXY_LIST` takes several proxy URLs (comma, semicolon, or
+newline separated — Webshare-style `http://user:pass@host:port`):
+
+```bash
+YT_DLP_PROXY_LIST="http://user:pass@1.2.3.4:6014,http://user:pass@5.6.7.8:6641,..."
+```
+
+- **Every yt-dlp call rotates to the next IP** (round-robin): the flat
+  search and each candidate download ride different addresses, which
+  spreads the request rate the way "space requests apart" wants.
+- A proxy that fails — dead endpoint, auth error, hang, or an IP YouTube
+  flags with a bot check/429 — is **benched for 10 minutes**
+  (`YT_DLP_PROXY_BENCH_MS` to change) and the rest keep working. Content
+  failures ("private video") don't bench anything; that's not the
+  proxy's fault.
+- While rotation is active (2+ proxies), the 300 s global cooldown is
+  **not** applied — one flagged IP shouldn't stall the other nine, and
+  each call is already on a different address. With a single proxy or a
+  direct connection, the cooldown applies exactly as before.
+- Only yt-dlp traffic rotates. Baileys/WhatsApp always stays direct.
+
+For Webshare's dashboard: Authentication = Username/Password, Connection
+= Direct Connection, then build `http://<username>:<password>@<address>:<port>`
+for each row.
+
 `.tiktok`/`.ig`/`.pinterest`/`.fb` use tikwm.com and api-faa.my.id. Those are third-party scraper APIs, not official platform APIs — they can change or go down without notice. If one stops working, the fix is updating the relevant fetch function in `utils/downloaders/fetchers.js`.
 
 Replying to a message that contains a supported link also works for `.dl`.
