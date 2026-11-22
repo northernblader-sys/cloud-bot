@@ -17,19 +17,20 @@
  *
  *     cache hit?  ->  send
  *        | no
- *     SoundCloud (candidate 1 -> 2 -> ...)   <- FIRST CHOICE: no bot check,
- *        | fail                                no proxy needed, ~4s per track
- *     Knight API (candidate 1 -> ...)        (MP3 on savetube.vip CDN —
- *        | fail                               no IP lock, no expiry)
- *     Prexzy ytmp3 (candidate 1 -> ...)      (.m4a googlevideo link — EXPIRES,
- *        | fail                               download immediately, never store)
- *     yt-dlp (songfetch method)              last resort only; the 300s YouTube
- *                                            IP cooldown gates ONLY this stage
+ *     Prexzy ytmp3 (candidate 1 -> 2 -> ...)  <- FIRST: YouTube -> .m4a
+ *        | fail                                (googlevideo link — EXPIRES,
+ *        |                                      download immediately, never store)
+ *     Knight API (candidate 1 -> ...)          YouTube -> MP3 on savetube.vip
+ *        | fail                                CDN (no IP lock, no expiry)
+ *     SoundCloud (candidate 1 -> ...)          no bot check, no proxy needed;
+ *        | fail                                reached lazily, own search
+ *     yt-dlp (songfetch method)                last resort only; the 300s YouTube
+ *                                              IP cooldown gates ONLY this stage
  *
  * Same-API-next-candidate before switching APIs: one dead upload is not a
- * dead API. Pasted soundcloud.com / snd.sc links bypass the YouTube flow
- * entirely (resolve -> card from SC metadata -> download). The YouTube
- * flat search runs lazily — only when SoundCloud has failed. Whichever
+ * dead API. The YouTube flat search runs up front (both YouTube APIs take
+ * watch URLs). Pasted soundcloud.com / snd.sc links bypass the YouTube
+ * flow entirely (resolve -> card from SC metadata -> download). Whichever
  * stage wins, the file is sent DIRECTLY (mp3/m4a are natively playable
  * WhatsApp audio formats — no transcode, no "Converting..." wait; the
  * Opus/OGG path remains only as a send-failure fallback). The metadata
@@ -237,10 +238,9 @@ async function play(sock, from, msg, argText) {
   if (wantVideo) return playVideo(sock, from, query, say);
 
   // ── Audio mode ──
-  // Chain order (first choice per the SoundCloud write-up):
-  //   cache → SoundCloud (Prexzy SC endpoints) → Knight → Prexzy ytmp3 → yt-dlp.
-  // SoundCloud has no bot check, works from any server IP, and needs no
-  // proxy — so it is stage 1. The YouTube IP cooldown gates ONLY yt-dlp.
+  // Chain order (per the user: Prexzy first, then Knight, then SoundCloud):
+  //   cache → Prexzy ytmp3 → Knight → SoundCloud (Prexzy SC endpoints) → yt-dlp.
+  // The YouTube IP cooldown gates ONLY the yt-dlp stage.
 
   // A pasted SoundCloud link (soundcloud.com/... or snd.sc/...) bypasses
   // the YouTube flow entirely: resolve it, card from SC metadata, done.
@@ -296,54 +296,62 @@ async function play(sock, from, msg, argText) {
   if (wasCached) {
     await say(`♻️ Cached: *${title}*`);
   } else {
-    // ── Stage 1: SoundCloud (first choice — no bot check, no proxy needed).
-    // The search happens in the bot (the API takes names and links); each
-    // attempt edits the status so nothing looks frozen.
-    let apiResult = null;
+    // ── Stages 1+2: Prexzy ytmp3, then Knight — the YouTube-based APIs,
+    // first in the chain. The flat search runs up front: both take
+    // watch URLs, so the video-ID list is needed immediately.
+    let candidates = [];
+    let searchError = null;
     try {
-      const scRows = await searchSoundCloud(query, 8);
-      const rankedSc = rankSoundCloud(scRows, query);
-      if (rankedSc.length > 0) {
-        apiResult = await downloadSoundCloudCandidates({
-          candidates: rankedSc,
-          outBase,
-          onAttempt: (label) => say(`☁️ ${label}...`),
-        });
-      }
-    } catch (scErr) {
-      console.error(
-        "soundcloud stage failed (falling through):",
-        (scErr && scErr.message) || scErr
-      );
+      candidates = rank(await search(query, { limit: 5 }), query);
+    } catch (err) {
+      searchError = err;
     }
 
-    // ── Stage 2+3: Knight, then Prexzy ytmp3 — the YouTube-based APIs.
-    // The flat search runs lazily: only now is a video-ID list needed,
-    // so a successful SoundCloud hit skips it entirely.
-    if (!apiResult) {
-      let candidates = [];
-      let searchError = null;
+    // The same API is retried with the NEXT candidate video before
+    // switching APIs: one dead upload is not a dead API. Each attempt
+    // edits the status message so ~7s-per-attempt doesn't look frozen.
+    let apiResult = null;
+    if (candidates.length > 0) {
+      apiResult = await downloadViaApis({
+        candidates,
+        outBase,
+        onAttempt: (label) => say(`${label}...`),
+      });
+    }
+
+    if (apiResult) {
+      await say(`✅ Downloaded via ${apiResult.source} API`);
+    } else {
+      // ── Stage 3: SoundCloud — its own search, reached lazily only after
+      // both YouTube APIs failed. No bot check, no proxy needed.
+      let scDownloaded = false;
       try {
-        candidates = rank(await search(query, { limit: 5 }), query);
-      } catch (err) {
-        searchError = err;
+        const scRows = await searchSoundCloud(query, 8);
+        const rankedSc = rankSoundCloud(scRows, query);
+        if (rankedSc.length > 0) {
+          const scResult = await downloadSoundCloudCandidates({
+            candidates: rankedSc,
+            outBase,
+            onAttempt: (label) => say(`☁️ ${label}...`),
+          });
+          if (scResult) {
+            scDownloaded = true;
+            await say(
+              `✅ Downloaded from SoundCloud${scResult.author ? ` — ${scResult.author}` : ""}`
+            );
+          }
+        }
+      } catch (scErr) {
+        console.error(
+          "soundcloud stage failed (falling through):",
+          (scErr && scErr.message) || scErr
+        );
       }
 
-      // The same API is retried with the NEXT candidate video before
-      // switching APIs: one dead upload is not a dead API.
-      if (candidates.length > 0) {
-        apiResult = await downloadViaApis({
-          candidates,
-          outBase,
-          onAttempt: (label) => say(`${label}...`),
-        });
-      }
-
-      if (apiResult) {
-        await say(`✅ Downloaded via ${apiResult.source} API`);
-      } else {
-        // ── Stage 4: yt-dlp last resort. The YouTube IP cooldown gates
-        // ONLY this path — every API stage ran first.
+      // ── Stage 4: yt-dlp last resort (skipped when SoundCloud already
+      // wrote the file). The YouTube IP cooldown gates ONLY this path —
+      // every API stage ran first.
+      if (!scDownloaded) {
         if (
           searchError &&
           /binary not found/i.test(String((searchError && searchError.message) || searchError))
@@ -369,8 +377,6 @@ async function play(sock, from, msg, argText) {
           return say(failureMessage(title));
         }
       }
-    } else {
-      await say(`✅ Downloaded from SoundCloud${apiResult.author ? ` — ${apiResult.author}` : ""}`);
     }
   }
 

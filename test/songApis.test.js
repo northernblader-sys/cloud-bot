@@ -216,6 +216,7 @@ test("downloadViaApis retries the SAME API with the next candidate before switch
     const result = await downloadViaApis({
       candidates,
       outBase: path.join(dir, "Song"),
+      order: ["knight", "prexzy"],
       fetchImpl: f,
       onAttempt: () => {},
     });
@@ -269,6 +270,7 @@ test("downloadViaApis falls to Prexzy only after every Knight candidate fails", 
     const result = await downloadViaApis({
       candidates,
       outBase: path.join(dir, "Song"),
+      order: ["knight", "prexzy"],
       fetchImpl: f,
       onAttempt: (l) => labels.push(l),
     });
@@ -331,6 +333,46 @@ test("downloadViaApis honors KNIGHT_API_URL / PREXZY_API_URL env overrides", asy
     else process.env.KNIGHT_API_URL = before.k;
     if (before.p === undefined) delete process.env.PREXZY_API_URL;
     else process.env.PREXZY_API_URL = before.p;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("default order is prexzy-first (user's chain), knight second", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "songapis-test-"));
+  const prevEnv = { k: process.env.KNIGHT_API_URL, p: process.env.PREXZY_API_URL };
+  process.env.KNIGHT_API_URL = "https://knight.example";
+  process.env.PREXZY_API_URL = "https://prexzy.example";
+  try {
+    const order = [];
+    const f = fakeFetch((url, opts) => {
+      if (url.includes("cdn.example")) return mediaResponse(url, opts);
+      if (url.includes("prexzy.example")) {
+        order.push("prexzy");
+        return { ok: false, status: 500, headers: new Map() };
+      }
+      order.push("knight");
+      return okJson({
+        success: true,
+        result: { title: "Song", id: "1", download: "https://cdn.example/a.mp3" },
+      });
+    });
+    // No `order` option — the default must try Prexzy first. Prexzy fails
+    // for candidate 1, Knight picks it up from there.
+    const result = await downloadViaApis({
+      candidates: [{ id: "1", title: "A", url: "https://www.youtube.com/watch?v=1" }],
+      outBase: path.join(dir, "Song"),
+      fetchImpl: f,
+    });
+    assert.ok(result);
+    assert.equal(result.source, "knight");
+    assert.deepEqual(order, ["prexzy", "knight"], "prexzy tried before knight by default");
+    assert.equal(result.path, path.join(dir, "Song.mp3"));
+    assert.ok(fs.existsSync(result.path));
+  } finally {
+    if (prevEnv.k === undefined) delete process.env.KNIGHT_API_URL;
+    else process.env.KNIGHT_API_URL = prevEnv.k;
+    if (prevEnv.p === undefined) delete process.env.PREXZY_API_URL;
+    else process.env.PREXZY_API_URL = prevEnv.p;
     await rm(dir, { recursive: true, force: true });
   }
 });
