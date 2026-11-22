@@ -21,6 +21,12 @@ const {
   fetchCover,
   lookupCover,
   downloadTrack,
+  classifyError,
+  cooldownRemainingMs,
+  clearCooldown,
+  lastFailureInfo,
+  YT_COOLDOWN_MS,
+  ATTEMPT_GAP_MS,
 } = require(path.join(__dirname, "..", "utils", "songfetch.js"));
 
 test("fold lowercases and strips diacritics", () => {
@@ -92,15 +98,46 @@ test("search parses id/title lines and skips NA", async () => {
 });
 
 test("search returns [] on runner failure but rethrows missing binary", async () => {
+  clearCooldown();
+  // An ordinary failure (not a bot check / 429) still returns [] — and
+  // must NOT start the IP cooldown.
   const failing = async () => {
-    throw new Error("HTTP 429 too many requests");
+    throw new Error("flat-playlist failed: yt-dlp exploded");
   };
   assert.deepEqual(await search("x", { ytdlpImpl: failing }), []);
+  assert.equal(cooldownRemainingMs(), 0, "ordinary search failure: no cooldown");
 
   const missing = async () => {
     throw new Error("yt-dlp binary not found at bin/yt-dlp");
   };
   await assert.rejects(() => search("x", { ytdlpImpl: missing }), /binary not found/);
+});
+
+test("classifyError maps yt-dlp's failure lines to the real cause", () => {
+  // From the diagnosis: "use --cookies" is a static suffix; the real
+  // cause is the line before it.
+  assert.equal(
+    classifyError(new Error("ERROR: [youtube] oytOOA9sOiE: Sign in to confirm you're not a bot.")),
+    "botcheck"
+  );
+  assert.equal(classifyError(new Error("ERROR: HTTP Error 429: Too Many Requests")), "ratelimit");
+  assert.equal(classifyError(new Error("ERROR: [youtube] x: Private video. Sign in if you have access")), "unavailable");
+  assert.equal(classifyError(new Error("ERROR: [youtube] x: Video unavailable")), "unavailable");
+  assert.equal(classifyError(new Error("ERROR: [youtube] x: This video is age restricted")), "age");
+  assert.equal(classifyError(new Error("ERROR: Requested format is not available")), "format");
+  assert.equal(classifyError(new Error("something else entirely")), "other");
+});
+
+test("a 429 during search also starts the IP cooldown", async () => {
+  clearCooldown();
+  const failing = async () => {
+    throw new Error("ERROR: HTTP Error 429: Too Many Requests");
+  };
+  assert.deepEqual(await search("x", { ytdlpImpl: failing }), []);
+  assert.ok(cooldownRemainingMs() > 0, "cooldown started");
+  assert.equal(lastFailureInfo().kind, "ratelimit");
+  assert.equal(YT_COOLDOWN_MS, 300 * 1000, "300s, like player.py's YT_COOLDOWN");
+  clearCooldown();
 });
 
 test("clearPartials deletes scratch files but keeps the final file", async () => {
@@ -174,6 +211,7 @@ test("lookupCover requires exact artist match (iTunes, no wrong karaoke art)", a
 });
 
 test("downloadTrack tries ranked candidates until a file appears", async () => {
+  clearCooldown();
   const outRoot = await mkdtemp(path.join(os.tmpdir(), "songfetch-test-"));
   try {
     const candidates = [
@@ -213,6 +251,7 @@ test("downloadTrack tries ranked candidates until a file appears", async () => {
       ytdlpImpl,
       ffmpegImpl,
       fetchImpl: async () => ({ ok: false }),
+      attemptGapMs: 0,
     });
     assert.ok(result, "downloadTrack returns a path");
     assert.equal(attempts, 2, "tried both candidates");
@@ -224,15 +263,26 @@ test("downloadTrack tries ranked candidates until a file appears", async () => {
     assert.ok(result.endsWith(path.join("Artist", "Album", "Song.mp3")));
   } finally {
     await rm(outRoot, { recursive: true, force: true });
+    clearCooldown();
   }
 });
 
-test("downloadTrack returns null when every candidate fails", async () => {
+test("a bot check stops the candidate loop and starts the 300s cooldown", async () => {
+  clearCooldown();
   const outRoot = await mkdtemp(path.join(os.tmpdir(), "songfetch-test-"));
   try {
-    const searchImpl = async () => [{ id: "1", title: "Song", url: "https://www.youtube.com/watch?v=1" }];
-    const ytdlpImpl = async () => {
-      throw new Error("Sign in to confirm you're not a bot");
+    // 5 candidates, first one hits the IP wall. Hammering the rest would
+    // only extend the block (player.py), so the loop must stop at 1.
+    const searchImpl = async () =>
+      [1, 2, 3, 4, 5].map((n) => ({
+        id: String(n),
+        title: `Song ${n}`,
+        url: `https://www.youtube.com/watch?v=${n}`,
+      }));
+    const tried = [];
+    const ytdlpImpl = async (target) => {
+      tried.push(target);
+      throw new Error("ERROR: Sign in to confirm you're not a bot");
     };
     const result = await downloadTrack({
       artist: "",
@@ -242,14 +292,122 @@ test("downloadTrack returns null when every candidate fails", async () => {
       ytdlpImpl,
       ffmpegImpl: async () => 0,
       fetchImpl: async () => ({ ok: false }),
+      attemptGapMs: 0,
     });
     assert.equal(result, null);
+    assert.equal(tried.length, 1, "did NOT hammer the other candidates");
+    assert.ok(cooldownRemainingMs() > 0, "cooldown started");
+    assert.equal(lastFailureInfo().kind, "botcheck");
+    assert.match(lastFailureInfo().detail, /not a bot/);
   } finally {
     await rm(outRoot, { recursive: true, force: true });
+    clearCooldown();
+  }
+});
+
+test("while the cooldown is active, downloadTrack fails fast without touching YouTube", async () => {
+  clearCooldown();
+  const outRoot = await mkdtemp(path.join(os.tmpdir(), "songfetch-test-"));
+  try {
+    // Trigger the cooldown once.
+    const ytdlpImplBlock = async () => {
+      throw new Error("ERROR: HTTP Error 429: Too Many Requests");
+    };
+    await downloadTrack({
+      artist: "",
+      title: "Song",
+      outRoot,
+      searchImpl: async () => [{ id: "1", title: "Song", url: "https://www.youtube.com/watch?v=1" }],
+      ytdlpImpl: ytdlpImplBlock,
+      ffmpegImpl: async () => 0,
+      fetchImpl: async () => ({ ok: false }),
+      attemptGapMs: 0,
+    });
+    assert.ok(cooldownRemainingMs() > 0, "cooldown is now active");
+
+    // Next .play must fail fast: search/ytdlp are never called.
+    let calls = 0;
+    const result = await downloadTrack({
+      artist: "",
+      title: "Song",
+      outRoot,
+      searchImpl: async () => {
+        calls++;
+        return [];
+      },
+      ytdlpImpl: async () => {
+        calls++;
+        throw new Error("should not be called");
+      },
+      ffmpegImpl: async () => 0,
+      fetchImpl: async () => ({ ok: false }),
+      attemptGapMs: 0,
+    });
+    assert.equal(result, null);
+    assert.equal(calls, 0, "no YouTube requests during the cooldown");
+  } finally {
+    await rm(outRoot, { recursive: true, force: true });
+    clearCooldown();
+  }
+});
+
+test("ordinary failures (private video) do not start the cooldown", async () => {
+  clearCooldown();
+  const outRoot = await mkdtemp(path.join(os.tmpdir(), "songfetch-test-"));
+  try {
+    const result = await downloadTrack({
+      artist: "",
+      title: "Song",
+      outRoot,
+      searchImpl: async () => [{ id: "1", title: "Song", url: "https://www.youtube.com/watch?v=1" }],
+      ytdlpImpl: async () => {
+        throw new Error("ERROR: [youtube] 1: Private video. Sign in if you've been granted access");
+      },
+      ffmpegImpl: async () => 0,
+      fetchImpl: async () => ({ ok: false }),
+      attemptGapMs: 0,
+    });
+    assert.equal(result, null);
+    assert.equal(cooldownRemainingMs(), 0, "no cooldown for a genuinely gone video");
+    assert.equal(lastFailureInfo().kind, "unavailable");
+  } finally {
+    await rm(outRoot, { recursive: true, force: true });
+    clearCooldown();
+  }
+});
+
+test("candidate attempts are spaced apart (5s gap by default)", async () => {
+  clearCooldown();
+  const outRoot = await mkdtemp(path.join(os.tmpdir(), "songfetch-test-"));
+  try {
+    const searchImpl = async () =>
+      [1, 2].map((n) => ({ id: String(n), title: `Song ${n}`, url: `https://www.youtube.com/watch?v=${n}` }));
+    const stamps = [];
+    const ytdlpImpl = async () => {
+      stamps.push(Date.now());
+      throw new Error("nope");
+    };
+    await downloadTrack({
+      artist: "",
+      title: "Song",
+      outRoot,
+      searchImpl,
+      ytdlpImpl,
+      ffmpegImpl: async () => 0,
+      fetchImpl: async () => ({ ok: false }),
+      attemptGapMs: 30,
+    });
+    assert.equal(stamps.length, 2);
+    assert.ok(stamps[1] - stamps[0] >= 25, "second attempt waited for the gap");
+    assert.equal(ATTEMPT_GAP_MS, 5000, "default gap is 5s");
+  } finally {
+    await rm(outRoot, { recursive: true, force: true });
+    clearCooldown();
   }
 });
 
 test("downloadTrack falls back to one-shot ytsearch when search is empty", async () => {
+  clearCooldown();
   const outRoot = await mkdtemp(path.join(os.tmpdir(), "songfetch-test-"));
   try {
     const searchImpl = async () => [];
@@ -275,10 +433,54 @@ test("downloadTrack falls back to one-shot ytsearch when search is empty", async
       ytdlpImpl,
       ffmpegImpl,
       fetchImpl: async () => ({ ok: false }),
+      attemptGapMs: 0,
     });
     assert.ok(result);
     assert.equal(sawSearchTarget, true);
   } finally {
     await rm(outRoot, { recursive: true, force: true });
+    clearCooldown();
+  }
+});
+
+test("a blocked search skips the one-shot fallback (no hammering)", async () => {
+  clearCooldown();
+  const outRoot = await mkdtemp(path.join(os.tmpdir(), "songfetch-test-"));
+  try {
+    // The flat search hits the bot check: search() returns [] and starts
+    // the cooldown, so the ytsearch fallback must NOT fire.
+    const searchImpl = async () => [];
+    let fallbackCalled = false;
+    const ytdlpImpl = async (target) => {
+      if (String(target).startsWith("ytsearch5:")) {
+        fallbackCalled = true;
+        return "";
+      }
+      throw new Error("unreachable: no candidates were given");
+    };
+    // Real search() behavior: ytdlp throws → [] + cooldown. Simulate by
+    // calling search with a blocked runner, then feeding that result in.
+    const blockedSearch = async () =>
+      search("Song", {
+        ytdlpImpl: async () => {
+          throw new Error("ERROR: Sign in to confirm you're not a bot");
+        },
+      });
+    const result = await downloadTrack({
+      artist: "",
+      title: "Song",
+      outRoot,
+      searchImpl: blockedSearch,
+      ytdlpImpl,
+      ffmpegImpl: async () => 0,
+      fetchImpl: async () => ({ ok: false }),
+      attemptGapMs: 0,
+    });
+    assert.equal(result, null);
+    assert.equal(fallbackCalled, false, "fallback did not hammer YouTube");
+    assert.ok(cooldownRemainingMs() > 0);
+  } finally {
+    await rm(outRoot, { recursive: true, force: true });
+    clearCooldown();
   }
 });
