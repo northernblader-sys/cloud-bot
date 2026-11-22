@@ -34,6 +34,19 @@
  * and a proxy that fails (dead endpoint, or YouTube flagged its IP) is
  * benched for 10 minutes (`YT_DLP_PROXY_BENCH_MS`) so the rest keep
  * working. See README "If the IP stays blocked" for endpoint options.
+ *
+ * YouTube bot checks: YouTube walls datacenter IPs (Render's) behind
+ * "Sign in to confirm you're not a bot" on its default clients. Cookies
+ * are off the table for this bot, so instead every video download
+ * requests a ladder of client impersonations via --extractor-args (see
+ * YOUTUBE_LADDER) and, if yt-dlp still reports the wall on stderr,
+ * climbs two more rungs: --force-ipv4 + a webpage-free fetch, then an
+ * alternate client ladder (see buildAttempts). The optional `deno` npm
+ * package supplies the JS runtime that most ladder clients need to
+ * decode their streams; when it's installed its binary path is passed
+ * via --js-runtimes (android_vr, the ladder's bot-check bypass, works
+ * without any runtime). Flat `ytsearch:` calls skip all of it — no
+ * player API is involved there, so search stays single-attempt.
  */
 
 const fs = require("fs");
@@ -57,6 +70,31 @@ function maxAgeMsFromEnv() {
   const value = Number.isFinite(hours) ? hours : DEFAULT_MAX_AGE_HOURS;
   return value * 60 * 60 * 1000; // 0 = always refresh, negative = never
 }
+
+// --- Cookie-free YouTube bot-check workaround -------------------------------
+// YouTube's "Sign in to confirm you're not a bot" wall (playabilityStatus
+// reason + login hint) hits datacenter IPs on the default client set.
+// We never pass cookies, so instead we ask for a ladder of clients in ONE
+// yt-dlp run: the extractor tries each in order, warns-and-continues on
+// per-client failures, and merges whatever formats come back.
+//   android_vr     — JS-free, community-proven bot-check bypass (the carrier)
+//   tv_downgraded/tv/web_embedded/mweb — JS-dependent alternates; without a
+//     JS runtime their unsolvable sig/n formats are skipped non-fatally,
+//     with deno installed they contribute full format lists.
+const YOUTUBE_LADDER =
+  "youtube:player_client=android_vr,tv_downgraded,tv,web_embedded,mweb";
+// Second ladder for the retry pass (Grabora-style): different client mix
+// in case the first ladder is itself walled. ios is deliberately absent —
+// its GVS PO-token policy is required=True and we run no PO-token plugin.
+const YOUTUBE_LADDER_RETRY =
+  "youtube:player_client=web_creator,web,android_vr,tv_downgraded";
+// yt-dlp surfaces the wall on stderr as its error message (the playability
+// reason, echoed by raise_no_formats). Match the phrases YouTube uses.
+const BOT_CHECK_RE = /not a bot|sign in to confirm|login required/i;
+// The cookie how-to yt-dlp appends after the reason (_youtube_login_hint).
+// Cookies are rejected for this bot, so strip the advice from errors we
+// surface in chat — "Sign in to confirm you're not a bot." alone is clearer.
+const COOKIE_HINT_RE = /\s*Use --cookies[\s\S]*$/i;
 
 /** Where the yt-dlp binary lives. YT_DLP_PATH overrides for custom setups. */
 function binPath(platform = process.platform) {
@@ -310,39 +348,52 @@ function proxyArg(opts = {}) {
 }
 
 /**
- * Run yt-dlp against a URL with youtube-dl-exec-compatible flags.
- * Resolves with stdout (JSON-parsed when it looks like JSON), rejects with
- * an Error carrying yt-dlp's stderr on failure.
- *
- * @param {string} url
- * @param {object} [flags] camelCase yt-dlp flags, e.g. { extractAudio: true, audioFormat: "opus" }
- * @param {object} [opts]
- * @param {string} [opts.bin] binary path override (tests use this)
- * @param {number} [opts.timeoutMs] kill after this long (default 15 min; 0 disables)
+ * Locate the deno binary installed by the optional `deno` npm package.
+ * Returns an absolute path, or null when the package isn't installed —
+ * callers then simply omit --js-runtimes and the ladder's JS-free clients
+ * (android_vr) carry the download on their own.
  */
-function ytdlp(url, flags = {}, opts = {}) {
-  const bin = opts.bin || binPath();
-  if (!fs.existsSync(bin)) {
-    return Promise.reject(
-      new Error(
-        `yt-dlp binary not found at ${bin} — run \`npm install\` to download it ` +
-          `(or set YT_DLP_PATH)`
-      )
-    );
-  }
+function resolveDenoPath() {
+  const name = process.platform === "win32" ? "deno.exe" : "deno";
+  const p = path.join(__dirname, "..", "node_modules", "deno", name);
+  return fs.existsSync(p) ? p : null;
+}
 
-  const args = [...toArgs(flags)];
-  const proxy = proxyArg(opts);
-  if (proxy) {
-    args.push("--proxy", proxy);
-  }
-  args.push("--", url);  const timeoutMs =
-    opts.timeoutMs !== undefined
-      ? opts.timeoutMs
-      : process.env.YTDLP_TIMEOUT_MS
-        ? Number(process.env.YTDLP_TIMEOUT_MS)
-        : DEFAULT_TIMEOUT_MS;
+/**
+ * Build the flag sets for a bot-check-hardened run: three rungs, each a
+ * full yt-dlp invocation. Rung 1 is the plain client ladder; rungs 2-3
+ * add --force-ipv4 (the wall can be IP-family-specific) and skip the
+ * /watch webpage fetch (another wall surface), rung 3 switching to an
+ * alternate client mix. Every rung carries deno's path via --js-runtimes
+ * when available.
+ *
+ * @param {object} [flags] caller flags (youtube-dl-exec style)
+ * @param {object} [opts]
+ * @param {string|null} [opts.denoPath] undefined=auto-detect, null=disable
+ * @returns {object[]} flag objects, one per attempt, in order
+ */
+function buildAttempts(flags = {}, opts = {}) {
+  const deno = opts.denoPath !== undefined ? opts.denoPath : resolveDenoPath();
+  const rung = (extractorArgs, extra = {}) => {
+    const f = { ...flags, ...extra, extractorArgs };
+    // Auto-wire deno unless the caller pinned their own runtime.
+    if (deno && f.jsRuntimes === undefined) f.jsRuntimes = `deno:${deno}`;
+    return f;
+  };
+  return [
+    rung(YOUTUBE_LADDER),
+    rung(`${YOUTUBE_LADDER};player_skip=webpage`, { forceIpv4: true }),
+    rung(`${YOUTUBE_LADDER_RETRY};player_skip=webpage`, { forceIpv4: true }),
+  ];
+}
 
+/**
+ * One yt-dlp spawn. Resolves with stdout (JSON-parsed when it looks like
+ * JSON), rejects with an Error carrying yt-dlp's stderr on failure.
+ * `proxy` is the outbound proxy used for this attempt ("" = direct) —
+ * recorded on failure so a bad IP gets benched by the pool.
+ */
+function runOnce(bin, args, timeoutMs, proxy) {
   return new Promise((resolve, reject) => {
     const child = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
@@ -395,12 +446,99 @@ function ytdlp(url, flags = {}, opts = {}) {
   });
 }
 
+/**
+ * Run yt-dlp against a URL with youtube-dl-exec-compatible flags.
+ * Resolves with stdout (JSON-parsed when it looks like JSON), rejects with
+ * an Error carrying yt-dlp's stderr on failure.
+ *
+ * Bot-check handling (cookie-free): video URLs get buildAttempts()' three
+ * rungs (client ladder, then force-ipv4 + no-webpage, then an alternate
+ * ladder). A new rung starts ONLY when yt-dlp's stderr matches YouTube's
+ * wall; any other failure (404s, timeouts, network) surfaces after the
+ * first spawn. Flat `ytsearch:` calls skip the ladder entirely — no
+ * player API is involved, so search keeps main's single-attempt,
+ * fail-fast-into-cooldown behavior. The final error has yt-dlp's cookie
+ * advice stripped (cookies are rejected for this bot).
+ *
+ * Each rung resolves its own proxy: with a rotating pool a walled IP
+ * gets benched (penalizeProxy in runOnce) and the next rung rides the
+ * next proxy.
+ *
+ * @param {string} url
+ * @param {object} [flags] camelCase yt-dlp flags, e.g. { extractAudio: true, audioFormat: "opus" }
+ * @param {object} [opts]
+ * @param {string} [opts.bin] binary path override (tests use this)
+ * @param {number} [opts.timeoutMs] per-attempt kill timer (default 15 min; 0 disables)
+ * @param {string} [opts.proxy] per-call proxy override ("" disables; tests use this)
+ * @param {string|null} [opts.denoPath] JS-runtime binary override; null disables
+ *   --js-runtimes (default: auto-detect node_modules/deno)
+ */
+async function ytdlp(url, flags = {}, opts = {}) {
+  const bin = opts.bin || binPath();
+  if (!fs.existsSync(bin)) {
+    throw new Error(
+      `yt-dlp binary not found at ${bin} — run \`npm install\` to download it ` +
+        `(or set YT_DLP_PATH)`
+    );
+  }
+
+  const timeoutMs =
+    opts.timeoutMs !== undefined
+      ? opts.timeoutMs
+      : process.env.YTDLP_TIMEOUT_MS
+        ? Number(process.env.YTDLP_TIMEOUT_MS)
+        : DEFAULT_TIMEOUT_MS;
+
+  // Flat search never touches the player API — the ladder would only add
+  // pointless flags and triple the wall-failure latency, so keep the
+  // single plain attempt there.
+  const isFlatSearch = /^ytsearch\d*:/i.test(String(url));
+  const attempts = isFlatSearch ? [flags] : buildAttempts(flags, opts);
+
+  let lastErr;
+  for (let i = 0; i < attempts.length; i++) {
+    // One proxy per rung: a walled IP is benched and the next rung (or
+    // the next call) rides the next proxy in the pool.
+    const proxy = proxyArg(opts);
+    const args = [...toArgs(attempts[i])];
+    if (proxy) args.push("--proxy", proxy);
+    args.push("--", url);
+    try {
+      return await runOnce(bin, args, timeoutMs, proxy);
+    } catch (err) {
+      lastErr = err;
+      // Only YouTube's wall earns another rung; every other failure
+      // (404s, timeouts, network) is final after the first attempt.
+      const isLast = i === attempts.length - 1;
+      if (isLast || !BOT_CHECK_RE.test(String((err && err.message) || ""))) {
+        throw stripCookieHint(err);
+      }
+    }
+  }
+  /* istanbul ignore next — loop always returns or throws */
+  throw stripCookieHint(lastErr);
+}
+
+/** Drop yt-dlp's cookie how-to from a surfaced error (we never pass cookies). */
+function stripCookieHint(err) {
+  const msg = String((err && err.message) || "");
+  const cleaned = msg.replace(COOKIE_HINT_RE, "").trim();
+  if (!cleaned || cleaned === msg) return err;
+  const wrapped = new Error(cleaned);
+  wrapped.cause = err;
+  return wrapped;
+}
+
 module.exports = {
   ytdlp,
   toArgs,
   binPath,
   assetFor,
   installYtDlp,
+  resolveDenoPath,
+  buildAttempts,
+  YOUTUBE_LADDER,
+  YOUTUBE_LADDER_RETRY,
   parseProxyList,
   proxyPool,
   proxyArg,

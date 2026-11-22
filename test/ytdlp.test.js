@@ -11,9 +11,54 @@ const os = require("node:os");
 const { existsSync, readFileSync, writeFileSync } = require("node:fs");
 const { mkdtemp, chmod, stat, utimes, rm } = require("node:fs/promises");
 
-const { ytdlp, toArgs, assetFor, binPath, installYtDlp } = require(
-  path.join(__dirname, "..", "utils", "ytdlp.js")
-);
+const {
+  ytdlp,
+  toArgs,
+  assetFor,
+  binPath,
+  installYtDlp,
+  buildAttempts,
+  resolveDenoPath,
+  YOUTUBE_LADDER,
+  YOUTUBE_LADDER_RETRY,
+} = require(path.join(__dirname, "..", "utils", "ytdlp.js"));
+
+/** Restore an env var a test borrowed (undefined = delete). */
+function restoreEnv(key, prev) {
+  if (prev === undefined) delete process.env[key];
+  else process.env[key] = prev;
+}
+
+/**
+ * Fake yt-dlp driven by FAKE_YTDLP_MODE, logging every spawn's argv to
+ * FAKE_YTDLP_LOG (one JSON array per line) so tests can count attempts
+ * and inspect each rung's flags.
+ *   bot-once  — rung 1 dies with YouTube's wall, later rungs succeed
+ *   bot-always— every rung dies with the wall
+ *   http-always— every rung dies with a non-bot-check failure
+ */
+function fakeYtDlpScript() {
+  return (
+    "#!/usr/bin/env node\n" +
+    "const fs = require('fs');\n" +
+    "const args = process.argv.slice(2);\n" +
+    "fs.appendFileSync(process.env.FAKE_YTDLP_LOG, JSON.stringify(args) + '\\n');\n" +
+    "const n = fs.readFileSync(process.env.FAKE_YTDLP_LOG, 'utf8').trim().split('\\n').length;\n" +
+    "const mode = process.env.FAKE_YTDLP_MODE || '';\n" +
+    "if (mode === 'http-always') { console.error('ERROR: unable to download video data: HTTP Error 402: Payment Required'); process.exit(1); }\n" +
+    "const wall = \"ERROR: [youtube] oytOOA9sOiE: Sign in to confirm you're not a bot. Use --cookies-from-browser or --cookies for the authentication. See https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies for how to manually pass cookies.\";\n" +
+    "if (mode === 'bot-always' || (mode === 'bot-once' && n === 1)) { console.error(wall); process.exit(1); }\n" +
+    "console.log(JSON.stringify({ args }));\n"
+  );
+}
+
+/** Spawn log written by fakeYtDlpScript: array of argv arrays, in order. */
+function readSpawns(log) {
+  return readFileSync(log, "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+}
 
 test("toArgs converts flags exactly like youtube-dl-exec did", () => {
   assert.deepEqual(
@@ -247,20 +292,192 @@ test("ytdlp spawns the binary, passes args, and resolves stdout", async (t) => {
   );
   await chmod(fake, 0o755);
   try {
-    const out = await ytdlp("https://youtu.be/abc", { audioFormat: "opus", quiet: true }, { bin: fake });
+    // denoPath pinned: auto-resolve would inject --js-runtimes and make
+    // this exact-arg assertion depend on whether node_modules/deno ran
+    // its postinstall in this checkout.
+    const out = await ytdlp(
+      "https://youtu.be/abc",
+      { audioFormat: "opus", quiet: true },
+      { bin: fake, denoPath: null }
+    );
     assert.deepEqual(out.args, [
       "--audio-format",
       "opus",
       "--quiet",
+      "--extractor-args",
+      YOUTUBE_LADDER,
       "--",
       "https://youtu.be/abc",
     ]);
 
     await assert.rejects(
-      () => ytdlp("https://youtu.be/abc", { fail: true }, { bin: fake }),
+      () => ytdlp("https://youtu.be/abc", { fail: true }, { bin: fake, denoPath: null }),
       /HTTP 402 refused/
     );
   } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("toArgs converts the bot-check flag keys yt-dlp understands", () => {
+  assert.deepEqual(
+    toArgs({
+      extractorArgs: YOUTUBE_LADDER,
+      jsRuntimes: "deno:/opt/deno",
+      forceIpv4: true,
+    }),
+    [
+      "--extractor-args",
+      YOUTUBE_LADDER,
+      "--js-runtimes",
+      "deno:/opt/deno",
+      "--force-ipv4",
+    ]
+  );
+});
+
+test("buildAttempts produces the three rungs with deno on every attempt", () => {
+  const attempts = buildAttempts({ quiet: true, audioFormat: "opus" }, { denoPath: "/opt/deno" });
+  assert.equal(attempts.length, 3);
+
+  // Rung 1: plain client ladder.
+  assert.equal(attempts[0].extractorArgs, YOUTUBE_LADDER);
+  assert.equal(attempts[0].forceIpv4, undefined);
+  // Rung 2: same ladder, no-webpage + force-ipv4.
+  assert.equal(attempts[1].extractorArgs, `${YOUTUBE_LADDER};player_skip=webpage`);
+  assert.equal(attempts[1].forceIpv4, true);
+  // Rung 3: alternate client mix, no-webpage + force-ipv4.
+  assert.equal(attempts[2].extractorArgs, `${YOUTUBE_LADDER_RETRY};player_skip=webpage`);
+  assert.equal(attempts[2].forceIpv4, true);
+  // ios must stay out of every rung (GVS PO-token required=True).
+  for (const a of attempts) assert.ok(!/ios/.test(a.extractorArgs), "no ios client");
+
+  // Caller flags ride along on every rung; deno is attached to every rung.
+  for (const a of attempts) {
+    assert.equal(a.quiet, true);
+    assert.equal(a.audioFormat, "opus");
+    assert.equal(a.jsRuntimes, "deno:/opt/deno");
+  }
+
+  // denoPath: null disables --js-runtimes entirely.
+  for (const a of buildAttempts({}, { denoPath: null })) {
+    assert.equal(a.jsRuntimes, undefined);
+  }
+
+  // Auto-detect (no denoPath in opts) matches resolveDenoPath().
+  const auto = buildAttempts({})[0];
+  const detected = resolveDenoPath();
+  assert.equal(auto.jsRuntimes, detected ? `deno:${detected}` : undefined);
+});
+
+test("resolveDenoPath points at the npm-installed binary or null", () => {
+  const p = resolveDenoPath();
+  const expected = process.platform === "win32" ? "deno.exe" : "deno";
+  const binary = path.join(__dirname, "..", "node_modules", "deno", expected);
+  if (p === null) {
+    // No binary — valid state (package absent, or installed with
+    // --ignore-scripts so its postinstall never created the hardlink).
+    assert.equal(existsSync(binary), false, "null means the binary is absent");
+    return;
+  }
+  assert.equal(p, binary, "resolved path is the package's binary");
+  assert.ok(existsSync(p), "resolved path exists");
+});
+
+test("ytdlp retries the bot-check wall once with force-ipv4 + no-webpage", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("fake binary uses a shebang");
+    return;
+  }
+  const dir = await mkdtemp(path.join(os.tmpdir(), "ytdlp-test-"));
+  const fake = path.join(dir, "fake-yt-dlp");
+  const log = path.join(dir, "spawns.log");
+  writeFileSync(fake, fakeYtDlpScript());
+  await chmod(fake, 0o755);
+  const prevMode = process.env.FAKE_YTDLP_MODE;
+  const prevLog = process.env.FAKE_YTDLP_LOG;
+  try {
+    process.env.FAKE_YTDLP_MODE = "bot-once";
+    process.env.FAKE_YTDLP_LOG = log;
+    const out = await ytdlp("https://youtu.be/abc", { quiet: true }, { bin: fake, denoPath: null });
+
+    const spawns = readSpawns(log);
+    assert.equal(spawns.length, 2, "wall on rung 1 → exactly one retry");
+    // Rung 1: plain ladder, no force-ipv4.
+    assert.deepEqual(spawns[0].slice(0, 4), ["--quiet", "--extractor-args", YOUTUBE_LADDER, "--"]);
+    // Rung 2: force-ipv4 + player_skip=webpage on the same ladder.
+    assert.deepEqual(out.args, spawns[1]);
+    assert.ok(out.args.includes("--force-ipv4"), "retry carries --force-ipv4");
+    const ea = out.args[out.args.indexOf("--extractor-args") + 1];
+    assert.equal(ea, `${YOUTUBE_LADDER};player_skip=webpage`);
+  } finally {
+    restoreEnv("FAKE_YTDLP_MODE", prevMode);
+    restoreEnv("FAKE_YTDLP_LOG", prevLog);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("ytdlp climbs all three rungs on a persistent wall, then strips the cookie hint", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("fake binary uses a shebang");
+    return;
+  }
+  const dir = await mkdtemp(path.join(os.tmpdir(), "ytdlp-test-"));
+  const fake = path.join(dir, "fake-yt-dlp");
+  const log = path.join(dir, "spawns.log");
+  writeFileSync(fake, fakeYtDlpScript());
+  await chmod(fake, 0o755);
+  const prevMode = process.env.FAKE_YTDLP_MODE;
+  const prevLog = process.env.FAKE_YTDLP_LOG;
+  try {
+    process.env.FAKE_YTDLP_MODE = "bot-always";
+    process.env.FAKE_YTDLP_LOG = log;
+    await assert.rejects(
+      () => ytdlp("https://youtu.be/abc", {}, { bin: fake, denoPath: null }),
+      (err) => {
+        // Cookie how-to is dropped; the actual reason stays.
+        assert.doesNotMatch(err.message, /Use --cookies/i);
+        assert.match(err.message, /Sign in to confirm you're not a bot/);
+        return true;
+      }
+    );
+
+    const spawns = readSpawns(log);
+    assert.equal(spawns.length, 3, "wall persists → all three rungs tried");
+    // Rung 3 uses the alternate ladder, still no-webpage + force-ipv4.
+    assert.ok(spawns[2].includes("--force-ipv4"));
+    const ea = spawns[2][spawns[2].indexOf("--extractor-args") + 1];
+    assert.equal(ea, `${YOUTUBE_LADDER_RETRY};player_skip=webpage`);
+  } finally {
+    restoreEnv("FAKE_YTDLP_MODE", prevMode);
+    restoreEnv("FAKE_YTDLP_LOG", prevLog);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("ytdlp does not retry failures that aren't the bot check", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("fake binary uses a shebang");
+    return;
+  }
+  const dir = await mkdtemp(path.join(os.tmpdir(), "ytdlp-test-"));
+  const fake = path.join(dir, "fake-yt-dlp");
+  const log = path.join(dir, "spawns.log");
+  writeFileSync(fake, fakeYtDlpScript());
+  await chmod(fake, 0o755);
+  const prevMode = process.env.FAKE_YTDLP_MODE;
+  const prevLog = process.env.FAKE_YTDLP_LOG;
+  try {
+    process.env.FAKE_YTDLP_MODE = "http-always";
+    process.env.FAKE_YTDLP_LOG = log;
+    await assert.rejects(
+      () => ytdlp("https://youtu.be/abc", {}, { bin: fake, denoPath: null }),
+      /HTTP Error 402/
+    );
+    assert.equal(readSpawns(log).length, 1, "non-wall failure surfaces after one spawn");
+  } finally {
+    restoreEnv("FAKE_YTDLP_MODE", prevMode);
+    restoreEnv("FAKE_YTDLP_LOG", prevLog);
     await rm(dir, { recursive: true, force: true });
   }
 });

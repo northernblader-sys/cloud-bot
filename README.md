@@ -115,7 +115,11 @@ YouTube breaks old extractors between releases, so a stale binary shows up
 as mystery bot checks. (`youtube-dl-exec` was tried first and dropped: its installer
 demands a system Python 3.11+, which Render doesn't ship, and its default
 download is a Python zipapp that would need that interpreter at runtime too.)
-ffmpeg comes from the `ffmpeg-static` npm package. Downloads are cached in
+ffmpeg comes from the `ffmpeg-static` npm package. The optional `deno` npm
+package rides along as yt-dlp's JavaScript runtime (needed by most YouTube
+clients to decode their streams); it's a prebuilt binary, so it installs the
+same plain-`npm-install` way and, if it ever fails to install, yt-dlp just
+falls back to the JS-free clients. Downloads are cached in
 `cache/music/`, so repeating the same query is instant until the next deploy
 (Render's disk is ephemeral; mount a Render Disk at `./cache` if you want the
 cache to survive redeploys).
@@ -153,6 +157,15 @@ hit the exact same wall and chose **not** to use cookies:
   releases, and a current binary alone clears a lot of "bot checks".
 - Failure messages name the real cause (bot check, 429, age-restricted,
   private/removed) instead of a generic error.
+- Every video download also rides a **client ladder** instead of
+  YouTube's default clients: `android_vr,tv_downgraded,tv,web_embedded,mweb`
+  via `--extractor-args`, with two escalation rungs (`--force-ipv4`, a
+  webpage-free fetch, then an alternate client mix) that only start when
+  yt-dlp's stderr actually shows the wall — no cookies anywhere. The
+  optional `deno` npm package (installed by the same plain
+  `npm install`) is passed via `--js-runtimes` so the JS-dependent
+  clients can decode their streams; `android_vr` — the rung that
+  bypasses the check — needs no runtime at all.
 
 The biggest lever is outside the code: a datacenter IP (Render, a VPS)
 is what earns the bot check in the first place. A residential IP or a
