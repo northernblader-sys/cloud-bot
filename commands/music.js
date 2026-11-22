@@ -88,6 +88,7 @@ function failureMessage(what) {
     return (
       `🚫 YouTube is rate-limiting this server's IP${kind === "ratelimit" ? " (HTTP 429)" : " (bot check)"}.\n` +
       "It's the IP, not a login — cookies rarely help here, and retrying nonstop makes it worse.\n" +
+      "Tip: set YT_DLP_PROXY to route yt-dlp through a different IP (README: \"If the IP stays blocked\").\n" +
       `Cooling down for ~${mins} min; try *${what}* again after that.`
     );
   }

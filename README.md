@@ -162,6 +162,40 @@ downloads to a personal Google account (bulk automated downloading is a
 real ban risk), expire in weeks, and are a patch on an IP problem, not
 a fix.
 
+### If the IP stays blocked: route yt-dlp through a different IP
+
+Set `YT_DLP_PROXY` and every yt-dlp call (search + download, audio +
+video) goes through it — **WhatsApp traffic stays direct**, so the bot
+session is untouched. yt-dlp accepts standard URLs:
+
+```bash
+YT_DLP_PROXY="socks5h://user:pass@proxy-host:1080"
+# or an HTTP proxy:
+YT_DLP_PROXY="http://user:pass@proxy-host:8080"
+```
+
+Use `socks5h://` (not `socks5://`) for SOCKS endpoints — the `h` makes
+DNS resolve *through the proxy*, which is the point when your local IP
+is the problem.
+
+What to point it at, roughly cheapest-first:
+
+| Endpoint | Cost | Trade-offs |
+| --- | --- | --- |
+| Cloudflare WARP in proxy mode (`warp-cli proxy`, local SOCKS5) | free | needs to run on the bot host, so Render must use the Docker runtime — it can't be installed on the default Node image; Cloudflare egress works for YouTube most of the time but is shared too |
+| Cheap VPS + a tiny SOCKS5 server (`3proxy`, `gost`, `microsocks`) | ~$4–5/mo | a fresh datacenter IP that usually isn't flagged; can get flagged again if volume gets abusive — then move it |
+| Residential proxy service (IPRoyal, Smartproxy, Soax, …) | ~$1.5–4/GB | the most reliable against the bot check; audio traffic is small — a 4-minute song at best quality is ~8 MB, so 1,000 songs ≈ 8 GB; use a **sticky session** so one download doesn't change IP mid-flight |
+| Home machine as exit node (Tailscale/WireGuard) | free | egress = your home (residential) IP; needs the VPN client on the bot host, so again Docker runtime on Render — or just run the bot at home |
+
+Notes:
+
+- The 300 s cooldown still applies while a proxy is set — it protects
+  the proxy's IP from the same hammering.
+- Only yt-dlp traffic is proxied. `npm install`, Baileys, and every
+  other fetch go out the normal route.
+- Pick a proxy whose other users don't hammer YouTube — a shared VPN
+  exit with abuse history is the same problem you're escaping.
+
 `.tiktok`/`.ig`/`.pinterest`/`.fb` use tikwm.com and api-faa.my.id. Those are third-party scraper APIs, not official platform APIs — they can change or go down without notice. If one stops working, the fix is updating the relevant fetch function in `utils/downloaders/fetchers.js`.
 
 Replying to a message that contains a supported link also works for `.dl`.
