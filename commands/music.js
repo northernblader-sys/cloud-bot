@@ -9,13 +9,14 @@
  *   .play                    Show usage help.
  *
  * Dependencies (all npm — zero system packages needed, works on Render):
- *   - youtube-dl-exec   ->  npm i youtube-dl-exec   (bundles yt-dlp binary)
+ *   - yt-dlp standalone binary -> fetched into bin/ by the root postinstall
+ *     script (scripts/install-ytdlp.js); no Python, no system packages
  *   - ffmpeg-static      ->  already in your package.json (bundles ffmpeg)
  *   - yt-search          ->  already in your package.json
  *   - fluent-ffmpeg      ->  already in your package.json
  *
- * Drop this file into commands/, wire it into handlers/router.js (see
- * SETUP.md), restart the bot. That's it.
+ * Drop this file into commands/, wire it into handlers/router.js, restart
+ * the bot. That's it.
  */
 
 const fs = require("fs");
@@ -23,7 +24,7 @@ const path = require("path");
 const yts = require("yt-search");
 const ffmpeg = require("fluent-ffmpeg");
 const ffmpegPath = require("ffmpeg-static");
-const youtubedl = require("youtube-dl-exec");
+const { ytdlp } = require("../utils/ytdlp");
 
 // Where to cache downloaded songs so a repeat .play is instant.
 const CACHE_DIR = path.join(__dirname, "..", "cache", "music");
@@ -136,7 +137,6 @@ async function play(sock, from, msg, argText) {
     return sock.sendMessage(from, {
       text:
         `⚠️ Download failed for "${video.title}".\n` +
-        `Make sure \`youtube-dl-exec\` is installed (\`npm i youtube-dl-exec\`).\n` +
         `_Error: ${String(err.message || err).slice(0, 200)}_`,
       edit: status.key,
     });
@@ -170,12 +170,13 @@ async function play(sock, from, msg, argText) {
 
 /**
  * Download + convert a YouTube URL to Opus/OGG (WhatsApp audio format).
- * Uses the bundled yt-dlp binary from youtube-dl-exec — no system yt-dlp needed.
+ * Uses the standalone yt-dlp binary in bin/ (fetched by the root
+ * postinstall script) — no Python, no system yt-dlp needed.
  */
 function downloadAudio(url, outFile) {
   // Step A: yt-dlp pulls the raw bestaudio stream to a temp opus file.
   const tmpRaw = outFile.replace(/\.ogg$/, ".raw.opus");
-  return youtubedl(url, {
+  return ytdlp(url, {
     extractAudio: true,
     audioFormat: "opus",
     audioQuality: 5,
@@ -208,10 +209,10 @@ function downloadAudio(url, outFile) {
 
 /**
  * Download a YouTube URL as an MP4 video (H.264 + AAC), 480p max for speed.
- * Uses the bundled yt-dlp binary from youtube-dl-exec.
+ * Uses the standalone yt-dlp binary in bin/ (fetched by the root postinstall).
  */
 function downloadVideo(url, outFile) {
-  return youtubedl(url, {
+  return ytdlp(url, {
     format: "best[height<=480][ext=mp4]/best[height<=480]/best",
     mergeOutputFormat: "mp4",
     noPlaylist: true,
