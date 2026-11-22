@@ -120,11 +120,17 @@ no proxy needed, and a 4-minute track lands as AAC ~160 kbps in ~4 s.
 The YouTube flat search runs lazily — only when the SoundCloud stage has
 failed — so a successful SC hit never pays for it.
 
-Whichever stage won, the audio is converted with `ffmpeg-static` into
-mono 48 kHz Opus in an OGG container — the exact format WhatsApp
-inline-plays (anything else is a tap-to-open document). The metadata
-card is sent before the download: iTunes for name queries, the
-SoundCloud response itself for pasted SC links.
+Whichever stage won, the audio file is sent **directly** as a WhatsApp
+audio message with its true mimetype — `audio/mpeg` for MP3, `audio/mp4`
+for M4A. Both are natively playable formats in WhatsApp (the same music
+bubble a phone gets when sending an `.m4a`), so there is **no
+transcode** and no "Converting for WhatsApp..." wait at all — this also
+means SoundCloud's AAC 160 kbps stereo reaches the chat untouched
+(previously it was re-encoded down to 64 kbps mono Opus). The Opus/OGG
+path is kept only as a fallback if a direct send errors out (it's
+mandatory only for voice-note mode, `ptt: true`, which the bot doesn't
+use). The metadata card is sent before the download: iTunes for name
+queries, the SoundCloud response itself for pasted SC links.
 `.play -v <song>` still uses yt-dlp directly (video APIs weren't part of
 the switch), with the same retry logic.
 
