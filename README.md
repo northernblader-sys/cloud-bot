@@ -100,7 +100,11 @@ pip, no Dockerfile changes — plain `npm install` works on Render's default
 Node environment. (`youtube-dl-exec` was tried first and dropped: its installer
 demands a system Python 3.11+, which Render doesn't ship, and its default
 download is a Python zipapp that would need that interpreter at runtime too.)
-ffmpeg comes from the `ffmpeg-static` npm package. Downloads are cached in
+ffmpeg comes from the `ffmpeg-static` npm package. The optional `deno` npm
+package rides along as yt-dlp's JavaScript runtime (needed by most YouTube
+clients to decode their streams); it's a prebuilt binary, so it installs the
+same plain-`npm-install` way and, if it ever fails to install, yt-dlp just
+falls back to the JS-free clients. Downloads are cached in
 `cache/music/`, so repeating the same query is instant until the next deploy
 (Render's disk is ephemeral; mount a Render Disk at `./cache` if you want the
 cache to survive redeploys).
@@ -110,9 +114,15 @@ Notes:
 - Tracks over 10 minutes are rejected up front (a 3-hour mix would stall the
   bot).
 - `.play` with no query just prints usage.
-- The download path runs `yt-dlp` against YouTube directly, so if YouTube
-  starts showing a bot check to your server's IP, the error surfaces in the
-  chat ("Download failed...") rather than failing silently.
+- The download path runs `yt-dlp` against YouTube directly. YouTube shows
+  datacenter IPs (like Render's) a "Sign in to confirm you're not a bot"
+  check on its default clients; rather than using cookies, `.play` asks
+  yt-dlp for a ladder of client impersonations
+  (`android_vr,tv_downgraded,tv,web_embedded,mweb`) and, if the wall still
+  shows up, retries with `--force-ipv4` and a second client ladder. The
+  optional `deno` package gives those clients the JS runtime they need.
+  If every rung fails, the error (minus yt-dlp's cookie suggestion)
+  surfaces in the chat ("Download failed...") rather than failing silently.
 
 `.tiktok`/`.ig`/`.pinterest`/`.fb` use tikwm.com and api-faa.my.id. Those are third-party scraper APIs, not official platform APIs — they can change or go down without notice. If one stops working, the fix is updating the relevant fetch function in `utils/downloaders/fetchers.js`.
 

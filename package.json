@@ -31,5 +31,8 @@
     "sharp": "^0.35.4",
     "ws": "^8.21.3",
     "yt-search": "^2.12.1"
+  },
+  "optionalDependencies": {
+    "deno": "^2.9.6"
   }
 }

@@ -213,7 +213,11 @@ function downloadAudio(url, outFile) {
  */
 function downloadVideo(url, outFile) {
   return ytdlp(url, {
-    format: "best[height<=480][ext=mp4]/best[height<=480]/best",
+    // The bot-check client ladder may only offer pre-merged mp4 above
+    // 480p, so fall back to DASH (video+audio merged by ffmpeg-static)
+    // before giving up on the height cap.
+    format:
+      "best[height<=480][ext=mp4]/bv[height<=480]+ba/b[height<=480]/best",
     mergeOutputFormat: "mp4",
     noPlaylist: true,
     noWarnings: true,
