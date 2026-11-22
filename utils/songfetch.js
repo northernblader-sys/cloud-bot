@@ -160,6 +160,9 @@ const ATTEMPT_GAP_MS = 5 * 1000; // "space requests 5-10s apart"
 const FAILURE_PATTERNS = [
   ["botcheck", /sign in to confirm|not a bot/i],
   ["ratelimit", /http error 429|\b429\b|too many requests/i],
+  // googlevideo refusing media downloads from a flagged IP — search on
+  // www.youtube.com can still work while the CDN 403s the actual audio.
+  ["forbidden", /http error 403|unable to download video data|access denied|\bforbidden\b/i],
   ["age", /\bage[- ]?restrict|\binappropriate\b/i],
   [
     "unavailable",
@@ -167,6 +170,9 @@ const FAILURE_PATTERNS = [
   ],
   ["format", /requested format is not available/i],
 ];
+
+/** Failure kinds that mean "the current IP/proxy is flagged", not "this video is gone". */
+const IP_FLAGGED_KINDS = ["botcheck", "ratelimit", "forbidden"];
 
 /** Map a yt-dlp failure to its real cause (see the table above). */
 function classifyError(err) {
@@ -183,20 +189,36 @@ let cooldownUntil = 0;
 let lastFailure = null; // { kind, detail, at } — the most recent attempt's cause
 
 /**
- * Record a failure's cause; starts the 300 s cooldown on bot check / 429.
- * The cooldown models music-seeker's single-IP world: the SAME address
- * must rest. When a rotating proxy pool is active, each call already
- * rides a different IP — the runner benches the offending proxy and the
- * global cooldown would needlessly stall the healthy ones, so it is
- * skipped (single proxy or direct connection: cooldown applies as ever).
+ * The most informative stderr line: prefer ERROR lines (the last one —
+ * earlier attempts' errors don't matter), fall back to the first line.
+ * yt-dlp emits WARNINGs first ("No title found in player responses...")
+ * and the real cause in an ERROR line below; showing the first line
+ * used to surface a cosmetic warning instead of the actual failure.
+ */
+function pickDetail(message) {
+  const lines = String(message || "")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const errors = lines.filter((l) => /^error:?/i.test(l) || (/error/i.test(l) && !/^warning/i.test(l)));
+  if (errors.length > 0) return errors[errors.length - 1];
+  return lines[0] || "";
+}
+
+/**
+ * Record a failure's cause; starts the 300 s cooldown when the *IP* is
+ * the problem (bot check / 429 / CDN 403). The cooldown models
+ * music-seeker's single-IP world: the SAME address must rest. When a
+ * rotating proxy pool is active, each call already rides a different
+ * IP — the runner benches the offending proxy and the global cooldown
+ * would needlessly stall the healthy ones, so it is skipped (single
+ * proxy or direct connection: cooldown applies as ever).
  */
 function noteFailure(err) {
   const kind = classifyError(err);
-  const detail = String((err && err.message) || err || "")
-    .split("\n")
-    .find((line) => line.trim()) || "";
-  lastFailure = { kind, detail: detail.trim().slice(0, 200), at: Date.now() };
-  if ((kind === "botcheck" || kind === "ratelimit") && !rotatingProxiesActive()) {
+  const detail = pickDetail(err && err.message).slice(0, 200);
+  lastFailure = { kind, detail, at: Date.now() };
+  if (IP_FLAGGED_KINDS.includes(kind) && !rotatingProxiesActive()) {
     cooldownUntil = Date.now() + YT_COOLDOWN_MS;
   }
   return lastFailure;
@@ -484,14 +506,16 @@ async function downloadTrack(opts = {}) {
     try {
       await ytdlpImpl(target, flags, { timeoutMs });
     } catch (err) {
+      console.error(
+        `[songfetch] candidate failed: ${target}\n${String((err && err.message) || err).slice(0, 600)}`
+      );
       noteFailure(err);
       const kind = classifyError(err);
-      // A bot check / 429 means the current IP is flagged: further
+      // A flagged IP (bot check / 429 / CDN 403) means further
       // candidates on the SAME IP only extend the block, so tell the
       // caller to stop. With a rotating proxy pool the next candidate
       // rides a different IP — keep going (the runner benched the bad one).
-      blocked =
-        (kind === "botcheck" || kind === "ratelimit") && !rotatingProxiesActive();
+      blocked = IP_FLAGGED_KINDS.includes(kind) && !rotatingProxiesActive();
       // Fall through: success is "does the file exist", not exit code.
     }
     if (fs.existsSync(finalFile)) return { ok: true, blocked: false };
@@ -581,10 +605,12 @@ module.exports = {
   downloadTrack,
   classifyError,
   noteFailure,
+  pickDetail,
   cooldownRemainingMs,
   clearCooldown,
   lastFailureInfo,
   DEMOTE,
+  IP_FLAGGED_KINDS,
   YT_SEARCH_TIMEOUT_MS,
   TRACK_DL_TIMEOUT_MS,
   TAG_TIMEOUT_MS,

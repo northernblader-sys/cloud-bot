@@ -286,7 +286,8 @@ function benchMs() {
  */
 const PROXY_FAULT_RE =
   /econnrefused|econnreset|etimedout|eproto|enotfound|getaddrinfo|socket hang up|unable to connect to (proxy|host)|proxy (connect|authentication|error)|tunnel|http error 407|timed out after/i;
-const PROXY_REPUTATION_RE = /sign in to confirm|not a bot|http error 429|too many requests/i;
+const PROXY_REPUTATION_RE =
+  /sign in to confirm|not a bot|http error 429|too many requests|http error 403|unable to download video data|access denied|forbidden/i;
 
 function isProxyFault(err) {
   const msg = String((err && err.message) || err || "");

@@ -609,3 +609,85 @@ test("with a single proxy (no rotation), the cooldown still applies", async () =
     clearCooldown();
   }
 });
+
+// ── real-error surfacing + HTTP 403 (CDN refusing flagged IPs) ──────────────
+
+const { pickDetail } = require(path.join(__dirname, "..", "utils", "songfetch.js"));
+
+test("pickDetail prefers the ERROR line over yt-dlp WARNINGs (and takes the last one)", () => {
+  const stderr =
+    "WARNING: [youtube] oytOOA9sOiE: No title found in player responses; falling back to title from initial data. Other metadata may also be missing\n" +
+    "ERROR: [youtube] oytOOA9sOiE: unable to download video data: HTTP Error 403: Forbidden";
+  assert.match(pickDetail(stderr), /^ERROR:.*403/);
+  assert.doesNotMatch(pickDetail(stderr), /No title found/);
+
+  const two =
+    "ERROR: [youtube] 1: first attempt failed\nERROR: [youtube] 1: Sign in to confirm you're not a bot";
+  assert.match(pickDetail(two), /Sign in to confirm/, "the LAST error wins");
+
+  assert.equal(pickDetail("yt-dlp exited with code 1"), "yt-dlp exited with code 1");
+  assert.equal(pickDetail(""), "");
+});
+
+test("HTTP 403 classifies as an IP flag and starts the cooldown on a single IP", async () => {
+  clearCooldown();
+  const outRoot = await mkdtemp(path.join(os.tmpdir(), "songfetch-test-"));
+  try {
+    const result = await downloadTrack({
+      artist: "",
+      title: "Song",
+      outRoot,
+      searchImpl: async () => [{ id: "1", title: "Song", url: "https://www.youtube.com/watch?v=1" }],
+      ytdlpImpl: async () => {
+        throw new Error(
+          "WARNING: [youtube] 1: No title found in player responses; falling back to title from initial data. Other metadata may also be missing\n" +
+            "ERROR: [youtube] 1: unable to download video data: HTTP Error 403: Forbidden"
+        );
+      },
+      ffmpegImpl: async () => 0,
+      fetchImpl: async () => ({ ok: false }),
+      attemptGapMs: 0,
+    });
+    assert.equal(result, null);
+    assert.ok(cooldownRemainingMs() > 0, "CDN 403 = flagged IP = cooldown");
+    assert.equal(lastFailureInfo().kind, "forbidden");
+    assert.match(lastFailureInfo().detail, /HTTP Error 403/, "detail is the ERROR line, not the WARNING");
+  } finally {
+    await rm(outRoot, { recursive: true, force: true });
+    clearCooldown();
+  }
+});
+
+test("with a rotating pool, a 403 keeps rotating (no cooldown, loop continues)", async () => {
+  clearCooldown();
+  const undo = withProxyList( "http://u:p@a:1,http://u:p@b:2");
+  const outRoot = await mkdtemp(path.join(os.tmpdir(), "songfetch-test-"));
+  try {
+    const searchImpl = async () =>
+      [1, 2].map((n) => ({ id: String(n), title: `Song ${n}`, url: `https://www.youtube.com/watch?v=${n}` }));
+    let call = 0;
+    const tried = [];
+    const result = await downloadTrack({
+      artist: "",
+      title: "Song",
+      outRoot,
+      searchImpl,
+      ytdlpImpl: async (target) => {
+        tried.push(target);
+        call++;
+        throw new Error("ERROR: [youtube] unable to download video data: HTTP Error 403: Forbidden");
+      },
+      ffmpegImpl: async () => 0,
+      fetchImpl: async () => ({ ok: false }),
+      attemptGapMs: 0,
+    });
+    assert.equal(result, null);
+    assert.equal(tried.length, 2, "kept rotating through IPs");
+    assert.equal(cooldownRemainingMs(), 0);
+    assert.equal(lastFailureInfo().kind, "forbidden");
+  } finally {
+    undo();
+    await rm(outRoot, { recursive: true, force: true });
+    clearCooldown();
+  }
+});
