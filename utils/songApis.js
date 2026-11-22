@@ -109,6 +109,7 @@ async function fetchKnight(videoUrl, opts = {}) {
     title: (data.result && data.result.title) || "",
     id: (data.result && data.result.id) || "",
     download,
+    thumbnail: (data.result && data.result.thumbnail) || "",
   };
 }
 
@@ -150,6 +151,8 @@ async function fetchPrexzy(videoUrl, opts = {}) {
     id: (data.info && data.info.id) || "",
     download,
     ext: data.ext || "m4a",
+    thumbnail: (data.info && data.info.thumbnail) || "",
+    uploader: (data.info && (data.info.uploader || data.info.channel)) || "",
   };
 }
 
@@ -241,7 +244,13 @@ async function downloadViaApis({
           dest = `${outBase}.${info.ext === "mp3" ? "mp3" : "m4a"}`;
         }
         await downloadTo(info.download, dest, { fetchImpl, timeoutMs: downloadTimeoutMs });
-        return { path: dest, source: api, title: info.title || cand.title || "" };
+        return {
+          path: dest,
+          source: api,
+          title: info.title || cand.title || "",
+          thumbnail: info.thumbnail || "",
+          author: info.uploader || "",
+        };
       } catch (err) {
         failures.push(`${api}#${cand.id}: ${String((err && err.message) || err).slice(0, 160)}`);
         // Clean a half-written file so the next attempt starts fresh.

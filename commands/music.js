@@ -140,6 +140,19 @@ function playUsage() {
   );
 }
 
+/** Download an image URL into a Buffer (null on any failure or tiny body). */
+async function fetchImageBuffer(url) {
+  if (!url) return null;
+  try {
+    const res = await fetch(url, { redirect: "follow" });
+    if (!res.ok) return null;
+    const buf = Buffer.from(await res.arrayBuffer());
+    return buf.length > 1000 ? buf : null; // <1 KB is an error page, not art
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Convert any audio input (yt-dlp MP3 or API .m4a — fluent-ffmpeg reads
  * the content, not the extension) to WhatsApp's inline-play format:
@@ -263,37 +276,15 @@ async function play(sock, from, msg, argText) {
   const outBase = path.join(albumDir, safeTitle);
 
   const cardPath = path.join(albumDir, `${safeTitle}.card.png`);
-  let trackInfo = null;
+  let trackInfo = null; // iTunes match — card fallback + yt-dlp tag art
   const wasCached = Boolean(fs.existsSync(mp3Path) || fs.existsSync(m4aPath));
-
-  // The metadata card: cover art with the real metadata drawn on it
-  // (name, artist, album • duration) — engine-independent, so it works
-  // for the API path and the yt-dlp path alike. Rendered once, cached
-  // next to the audio; skipped silently on errors (the ""-rule: never
-  // show wrong metadata).
-  try {
-    if (!fs.existsSync(cardPath)) {
-      trackInfo = await lookupTrackInfo(artist, title);
-      let coverBuf = null;
-      if (trackInfo && trackInfo.artworkUrl) {
-        const res = await fetch(trackInfo.artworkUrl, { redirect: "follow" }).catch(() => null);
-        if (res && res.ok) coverBuf = Buffer.from(await res.arrayBuffer());
-      }
-      const png = await buildTrackCard({
-        title: (trackInfo && trackInfo.trackName) || title,
-        artist: (trackInfo && trackInfo.artistName) || artist,
-        album: trackInfo ? trackInfo.collectionName : "",
-        durationMs: trackInfo ? trackInfo.durationMs : 0,
-        cover: coverBuf,
-      });
-      fs.writeFileSync(cardPath, png);
-    }
-    await sock.sendMessage(from, { image: fs.readFileSync(cardPath) });
-  } catch (cardErr) {
-    console.error("track card failed (continuing):", (cardErr && cardErr.message) || cardErr);
-  }
+  // What actually produced the master file: { source, title?, author?,
+  // thumbnail?/artwork? } — its thumbnail is the artwork of the exact
+  // upload the user is getting, so it beats any catalogue guess.
+  let served = null;
 
   if (wasCached) {
+    served = { source: "cache" };
     await say(`♻️ Cached: *${title}*`);
   } else {
     // ── Stages 1+2: Prexzy ytmp3, then Knight — the YouTube-based APIs,
@@ -320,11 +311,11 @@ async function play(sock, from, msg, argText) {
     }
 
     if (apiResult) {
+      served = apiResult;
       await say(`✅ Downloaded via ${apiResult.source} API`);
     } else {
       // ── Stage 3: SoundCloud — its own search, reached lazily only after
       // both YouTube APIs failed. No bot check, no proxy needed.
-      let scDownloaded = false;
       try {
         const scRows = await searchSoundCloud(query, 8);
         const rankedSc = rankSoundCloud(scRows, query);
@@ -335,7 +326,7 @@ async function play(sock, from, msg, argText) {
             onAttempt: (label) => say(`☁️ ${label}...`),
           });
           if (scResult) {
-            scDownloaded = true;
+            served = scResult;
             await say(
               `✅ Downloaded from SoundCloud${scResult.author ? ` — ${scResult.author}` : ""}`
             );
@@ -351,7 +342,7 @@ async function play(sock, from, msg, argText) {
       // ── Stage 4: yt-dlp last resort (skipped when SoundCloud already
       // wrote the file). The YouTube IP cooldown gates ONLY this path —
       // every API stage ran first.
-      if (!scDownloaded) {
+      if (!served) {
         if (
           searchError &&
           /binary not found/i.test(String((searchError && searchError.message) || searchError))
@@ -376,8 +367,56 @@ async function play(sock, from, msg, argText) {
         if (!got || !fs.existsSync(mp3Path)) {
           return say(failureMessage(title));
         }
+        served = { source: "yt-dlp" };
       }
     }
+  }
+
+  // The metadata card, built AFTER the download so it can use the serving
+  // stage's own thumbnail — the artwork of the exact upload the user is
+  // getting (Prexzy/Knight return one, SoundCloud's artwork, else the
+  // iTunes exact-artist match; the dark ♪ fallback card is the last
+  // resort and is NOT cached, so a later play can still pick up real art).
+  // Skipped silently on errors — the audio never depends on the card.
+  try {
+    if (!fs.existsSync(cardPath)) {
+      let coverBuf = null;
+      let cardTitle = title;
+      let cardArtist = artist;
+      let cardAlbum = "";
+      let cardDurationMs = 0;
+
+      const apiArt = served && (served.thumbnail || served.artwork);
+      if (apiArt) {
+        coverBuf = await fetchImageBuffer(apiArt);
+        cardTitle = served.title || title;
+        cardArtist = served.author || artist;
+      }
+      if (!coverBuf) {
+        trackInfo = trackInfo || (await lookupTrackInfo(artist, title));
+        if (trackInfo) {
+          coverBuf = await fetchImageBuffer(trackInfo.artworkUrl);
+          cardTitle = trackInfo.trackName;
+          cardArtist = trackInfo.artistName;
+          cardAlbum = trackInfo.collectionName;
+          cardDurationMs = trackInfo.durationMs;
+        }
+      }
+
+      const png = await buildTrackCard({
+        title: cardTitle,
+        artist: cardArtist,
+        album: cardAlbum,
+        durationMs: cardDurationMs,
+        cover: coverBuf,
+      });
+      if (coverBuf) fs.writeFileSync(cardPath, png);
+      await sock.sendMessage(from, { image: png });
+    } else {
+      await sock.sendMessage(from, { image: fs.readFileSync(cardPath) });
+    }
+  } catch (cardErr) {
+    console.error("track card failed (continuing):", (cardErr && cardErr.message) || cardErr);
   }
 
   // Send (shared tail — see sendAudioFile).
@@ -453,14 +492,11 @@ async function playSoundCloudLink(sock, from, query, scLink, say) {
   const cardPath = path.join(albumDir, `${safeTitle}.card.png`);
 
   // Metadata card from the SC response itself (artwork is often present
-  // here, unlike the search rows).
+  // here, unlike the search rows). Not cached without artwork — a later
+  // play can still pick up real art.
   try {
     if (!fs.existsSync(cardPath)) {
-      let coverBuf = null;
-      if (track.artwork) {
-        const res = await fetch(track.artwork, { redirect: "follow" }).catch(() => null);
-        if (res && res.ok) coverBuf = Buffer.from(await res.arrayBuffer());
-      }
+      const coverBuf = await fetchImageBuffer(track.artwork);
       const png = await buildTrackCard({
         title: track.title,
         artist: track.author,
@@ -468,9 +504,11 @@ async function playSoundCloudLink(sock, from, query, scLink, say) {
         durationMs: track.durationMs || 0,
         cover: coverBuf,
       });
-      fs.writeFileSync(cardPath, png);
+      if (coverBuf) fs.writeFileSync(cardPath, png);
+      await sock.sendMessage(from, { image: png });
+    } else {
+      await sock.sendMessage(from, { image: fs.readFileSync(cardPath) });
     }
-    await sock.sendMessage(from, { image: fs.readFileSync(cardPath) });
   } catch (cardErr) {
     console.error("track card failed (continuing):", (cardErr && cardErr.message) || cardErr);
   }

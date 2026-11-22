@@ -376,3 +376,48 @@ test("default order is prexzy-first (user's chain), knight second", async () => 
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("API results carry the upload's thumbnail/uploader for the metadata card", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "songapis-test-"));
+  const prevEnv = { k: process.env.KNIGHT_API_URL, p: process.env.PREXZY_API_URL };
+  process.env.KNIGHT_API_URL = "https://knight.example";
+  process.env.PREXZY_API_URL = "https://prexzy.example";
+  try {
+    // Prexzy succeeds on candidate 1 → its thumbnail/uploader surface.
+    const f = fakeFetch((url, opts) => {
+      if (url.includes("cdn.example") || url.includes("googlevideo.com")) {
+        return mediaResponse(url, opts);
+      }
+      if (url.includes("prexzy.example")) {
+        return okJson({
+          status: true,
+          info: {
+            id: "1",
+            title: "Mockingbird",
+            thumbnail: "https://i.ytimg.com/vi/1/hqdefault.jpg",
+            uploader: "SomeChannel",
+          },
+          download_url: "https://rr5---sn-x.googlevideo.com/videoplayback?expire=1",
+          ext: "m4a",
+        });
+      }
+      throw new Error("unexpected call: " + url);
+    });
+    const result = await downloadViaApis({
+      candidates: [{ id: "1", title: "q", url: "https://www.youtube.com/watch?v=1" }],
+      outBase: path.join(dir, "Song"),
+      fetchImpl: f,
+    });
+    assert.ok(result);
+    assert.equal(result.thumbnail, "https://i.ytimg.com/vi/1/hqdefault.jpg");
+    assert.equal(result.author, "SomeChannel");
+    assert.equal(result.source, "prexzy");
+    assert.ok(fs.existsSync(result.path));
+  } finally {
+    if (prevEnv.k === undefined) delete process.env.KNIGHT_API_URL;
+    else process.env.KNIGHT_API_URL = prevEnv.k;
+    if (prevEnv.p === undefined) delete process.env.PREXZY_API_URL;
+    else process.env.PREXZY_API_URL = prevEnv.p;
+    await rm(dir, { recursive: true, force: true });
+  }
+});

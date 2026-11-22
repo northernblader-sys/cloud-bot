@@ -129,8 +129,13 @@ means SoundCloud's AAC 160 kbps stereo reaches the chat untouched
 (previously it was re-encoded down to 64 kbps mono Opus). The Opus/OGG
 path is kept only as a fallback if a direct send errors out (it's
 mandatory only for voice-note mode, `ptt: true`, which the bot doesn't
-use). The metadata card is sent before the download: iTunes for name
-queries, the SoundCloud response itself for pasted SC links.
+use). The metadata card arrives right after the download, before the audio —
+built from the **serving stage's own thumbnail** (the artwork of the
+exact upload being sent: Prexzy/Knight return one, SoundCloud has
+artwork), falling back to the iTunes exact-artist match, and to a dark
+♪-glyph card only when nothing has art. Cards without artwork are not
+cached, so a later play can still pick up real art. For pasted SC links
+the card comes from the SoundCloud response itself.
 `.play -v <song>` still uses yt-dlp directly (video APIs weren't part of
 the switch), with the same retry logic.
 
