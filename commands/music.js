@@ -13,31 +13,29 @@
  *     script (scripts/install-ytdlp.js); no Python, no system packages
  *   - ffmpeg-static / fluent-ffmpeg -> already in package.json
  *
- * How it works — the songfetch.py method, followed exactly (ported in
- * utils/songfetch.js, which this file only drives):
+ * How it works — audio mode runs a four-stage fallback chain:
  *
- *   Audio mode calls downloadTrack() from utils/songfetch.js, which does
- *   the whole method:
- *     1. Search cheap, once. `yt-dlp --flat-playlist --no-warnings
- *        --print "%(id)s\t%(title)s" ytsearch5:<query>` returns the top
- *        5 titles as text in ~1s, no video downloaded.
- *     2. Rank them. Titles containing live/karaoke/cover are pushed to
- *        the back (never deleted), so the studio version is tried first.
- *     3. Try each one until a file appears. Success is "does the file
- *        exist", not exit code. Leftover .part files are deleted before
- *        each retry, otherwise attempt #2 would resume attempt #1's
- *        half-file and you'd get one song made of two different videos.
- *     4. Tag it yourself: one stream-copy ffmpeg pass writes real
- *        artist/title/album metadata plus the cover art (no re-encode).
- *     5. Cover art comes from the iTunes Search API (no key) with an
- *        exact-artist match — never from YouTube, and "" rather than a
- *        wrong karaoke-tribute image.
- *   The tagged MP3 is then re-muxed into mono 48 kHz Opus in an OGG
- *   container — the exact format WhatsApp inline-plays as an audio
- *   message (anything else shows up as a tap-to-open document).
+ *     cache hit?  ->  send
+ *        | no
+ *     Knight API (candidate 1)   https://knightbotapi.stream/api/download/ytaudio
+ *        | fail                  (MP3 on savetube.vip CDN — no IP lock, no expiry)
+ *     Knight API (candidate 2)   <- same API, next video ID: one dead upload
+ *        | ...                      is not a dead API
+ *     Prexzy (candidate 1...)    https://prexzyapis.com/download/ytmp3
+ *        | fail                  (.m4a googlevideo link — EXPIRES, download
+ *        |                        immediately, never store the URL)
+ *     yt-dlp (songfetch method)  last resort only; the 300s YouTube IP
+ *                                cooldown gates ONLY this stage
  *
- *   Video mode (.play -v) applies the same search → rank → try-each-
- *   candidate loop to MP4 downloads; there is no tagging step for video.
+ * The search happens in the bot (both APIs take a watch URL, not a song
+ * name): songfetch's flat search + rank. Each attempt edits the status
+ * message so ~7s-per-API-attempt doesn't look frozen. Whichever stage
+ * wins, the file is converted to mono 48 kHz Opus/OGG — the format
+ * WhatsApp inline-plays. The metadata card (cover + name/artist/album/
+ * duration from iTunes) is sent before the download, engine-independent.
+ *
+ * Video mode (.play -v) still uses yt-dlp directly (songfetch search ->
+ * rank -> try-each-candidate loop on MP4 downloads).
  *
  * No player-client overrides, no cookies, no retries/extractor-args
  * tricks anywhere — the download flags are exactly songfetch.py's.
@@ -49,6 +47,7 @@ const ffmpeg = require("fluent-ffmpeg");
 const ffmpegPath = require("ffmpeg-static");
 const { buildTrackCard } = require("../utils/trackCard");
 const { ytdlp, rotatingProxiesActive } = require("../utils/ytdlp");
+const { downloadViaApis } = require("../utils/songApis");
 const {
   search,
   rank,
@@ -57,6 +56,7 @@ const {
   parseArtistTitle,
   downloadTrack,
   lookupTrackInfo,
+  lookupCover,
   classifyError,
   noteFailure,
   cooldownRemainingMs,
@@ -130,11 +130,15 @@ function playUsage() {
   );
 }
 
-/** Convert the tagged MP3 to WhatsApp's inline-play format: mono 48 kHz Opus in OGG. */
-function mp3ToWhatsAppOgg(mp3Path, oggPath) {
+/**
+ * Convert any audio input (yt-dlp MP3 or API .m4a — fluent-ffmpeg reads
+ * the content, not the extension) to WhatsApp's inline-play format:
+ * mono 48 kHz Opus in OGG.
+ */
+function mp3ToWhatsAppOgg(inputPath, oggPath) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("audio conversion timed out")), 120 * 1000);
-    ffmpeg(mp3Path)
+    ffmpeg(inputPath)
       .audioCodec("libopus")
       .audioChannels(1)
       .audioFrequency(48000)
@@ -227,33 +231,24 @@ async function play(sock, from, msg, argText) {
   const safeAlbum = sanitize("") || "Unknown Album";
   const safeTitle = sanitize(title) || "Unknown";
   const albumDir = path.join(CACHE_ROOT, safeArtist, safeAlbum);
+  fs.mkdirSync(albumDir, { recursive: true }); // card/ogg writes need it on first play
   const mp3Path = path.join(albumDir, `${safeTitle}.mp3`);
+  const m4aPath = path.join(albumDir, `${safeTitle}.m4a`);
   const oggPath = path.join(albumDir, `${safeTitle}.ogg`);
+  const outBase = path.join(albumDir, safeTitle);
 
   const cardPath = path.join(albumDir, `${safeTitle}.card.png`);
   let trackInfo = null;
-
-  if (!fs.existsSync(mp3Path)) {
-    // player.py rule: while the IP cooldown is active, fail fast with the
-    // remaining time instead of re-flagging the address.
-    if (cooldownRemainingMs() > 0) {
-      return say(failureMessage(title));
-    }
-    // One iTunes request feeds both the metadata card and the tag pass:
-    // cover art (exact artist match, "" rather than a wrong image),
-    // display names, album and duration.
-    trackInfo = await lookupTrackInfo(artist, title);
-    await say(`📥 Downloading *${title}*...`);
-  }
+  const wasCached = Boolean(fs.existsSync(mp3Path) || fs.existsSync(m4aPath));
 
   // The metadata card: cover art with the real metadata drawn on it
-  // (name, artist, album • duration) — sent before the download starts
-  // and again on cached plays. Cached next to the audio so repeats skip
-  // the render; skipped silently when iTunes has no confident match
-  // (the ""-rule: never show wrong metadata).
+  // (name, artist, album • duration) — engine-independent, so it works
+  // for the API path and the yt-dlp path alike. Rendered once, cached
+  // next to the audio; skipped silently on errors (the ""-rule: never
+  // show wrong metadata).
   try {
     if (!fs.existsSync(cardPath)) {
-      if (!trackInfo) trackInfo = await lookupTrackInfo(artist, title);
+      trackInfo = await lookupTrackInfo(artist, title);
       let coverBuf = null;
       if (trackInfo && trackInfo.artworkUrl) {
         const res = await fetch(trackInfo.artworkUrl, { redirect: "follow" }).catch(() => null);
@@ -273,30 +268,77 @@ async function play(sock, from, msg, argText) {
     console.error("track card failed (continuing):", (cardErr && cardErr.message) || cardErr);
   }
 
-  if (!fs.existsSync(mp3Path)) {
-    // Steps 1-4: search once, rank, try each candidate until the file
-    // exists, clear .part files between attempts, tag it yourself.
-    const got = await downloadTrack({
-      artist,
-      title,
-      album: "",
-      fmt: "mp3",
-      outRoot: CACHE_ROOT,
-      imageUrl: trackInfo ? trackInfo.artworkUrl : "",
-      progress: (m) => say(`⏳ ${m}`),
-    });
-
-    if (!got || !fs.existsSync(mp3Path)) {
-      return say(failureMessage(title));
-    }
-  } else {
+  if (wasCached) {
     await say(`♻️ Cached: *${title}*`);
+  } else {
+    // The search happens in the bot (both APIs take a watch URL, not a
+    // song name): songfetch's flat search + rank, same as before.
+    let candidates = [];
+    let searchError = null;
+    try {
+      candidates = rank(await search(query, { limit: 5 }), query);
+    } catch (err) {
+      searchError = err;
+    }
+
+    // API phase — Knight (every candidate), then Prexzy (every candidate).
+    // The same API is retried with the NEXT candidate video before
+    // switching APIs: one dead upload is not a dead API. Each attempt
+    // edits the status message so ~7s-per-attempt doesn't look frozen.
+    let apiResult = null;
+    if (candidates.length > 0) {
+      apiResult = await downloadViaApis({
+        candidates,
+        outBase,
+        onAttempt: (label) => say(`${label}...`),
+      });
+    }
+
+    if (apiResult) {
+      await say(`✅ Downloaded via ${apiResult.source} API`);
+    } else {
+      // yt-dlp last resort. The YouTube IP cooldown gates ONLY this path —
+      // the APIs run first even while the server's YouTube route cools down.
+      if (
+        searchError &&
+        /binary not found/i.test(String((searchError && searchError.message) || searchError))
+      ) {
+        return say("⚠️ yt-dlp binary not found — run `npm install` to download it.");
+      }
+      if (cooldownRemainingMs() > 0) {
+        return say(failureMessage(title));
+      }
+      await say("🌀 Trying yt-dlp fallback...");
+      const imageUrl = trackInfo ? trackInfo.artworkUrl : await lookupCover(artist, title);
+      const got = await downloadTrack({
+        artist,
+        title,
+        album: "",
+        fmt: "mp3",
+        outRoot: CACHE_ROOT,
+        imageUrl,
+        progress: (m) => say(`⏳ ${m}`),
+      });
+
+      if (!got || !fs.existsSync(mp3Path)) {
+        return say(failureMessage(title));
+      }
+    }
   }
 
-  // WhatsApp inline-play format (Opus in OGG), cached next to the MP3.
-  if (!fs.existsSync(oggPath)) {
+  // WhatsApp inline-play format (Opus in OGG), cached next to the audio.
+  // The master may be the yt-dlp MP3 or an API .m4a — fluent-ffmpeg reads
+  // the content, not the extension. Re-convert when the master changed.
+  let master = fs.existsSync(mp3Path) ? mp3Path : fs.existsSync(m4aPath) ? m4aPath : null;
+  if (!master) {
+    return say(failureMessage(title));
+  }
+  const staleOgg =
+    !fs.existsSync(oggPath) ||
+    fs.statSync(oggPath).mtimeMs < fs.statSync(master).mtimeMs;
+  if (staleOgg) {
     await say("🎧 Converting for WhatsApp...");
-    await mp3ToWhatsAppOgg(mp3Path, oggPath);
+    await mp3ToWhatsAppOgg(master, oggPath);
   }
 
   await say("✅ Sending...");
