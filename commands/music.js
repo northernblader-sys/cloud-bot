@@ -13,26 +13,25 @@
  *     script (scripts/install-ytdlp.js); no Python, no system packages
  *   - ffmpeg-static / fluent-ffmpeg -> already in package.json
  *
- * How it works — audio mode runs a four-stage fallback chain:
+ * How it works — audio mode runs a five-stage fallback chain:
  *
  *     cache hit?  ->  send
  *        | no
- *     Knight API (candidate 1)   https://knightbotapi.stream/api/download/ytaudio
- *        | fail                  (MP3 on savetube.vip CDN — no IP lock, no expiry)
- *     Knight API (candidate 2)   <- same API, next video ID: one dead upload
- *        | ...                      is not a dead API
- *     Prexzy (candidate 1...)    https://prexzyapis.com/download/ytmp3
- *        | fail                  (.m4a googlevideo link — EXPIRES, download
- *        |                        immediately, never store the URL)
- *     yt-dlp (songfetch method)  last resort only; the 300s YouTube IP
- *                                cooldown gates ONLY this stage
+ *     SoundCloud (candidate 1 -> 2 -> ...)   <- FIRST CHOICE: no bot check,
+ *        | fail                                no proxy needed, ~4s per track
+ *     Knight API (candidate 1 -> ...)        (MP3 on savetube.vip CDN —
+ *        | fail                               no IP lock, no expiry)
+ *     Prexzy ytmp3 (candidate 1 -> ...)      (.m4a googlevideo link — EXPIRES,
+ *        | fail                               download immediately, never store)
+ *     yt-dlp (songfetch method)              last resort only; the 300s YouTube
+ *                                            IP cooldown gates ONLY this stage
  *
- * The search happens in the bot (both APIs take a watch URL, not a song
- * name): songfetch's flat search + rank. Each attempt edits the status
- * message so ~7s-per-API-attempt doesn't look frozen. Whichever stage
- * wins, the file is converted to mono 48 kHz Opus/OGG — the format
- * WhatsApp inline-plays. The metadata card (cover + name/artist/album/
- * duration from iTunes) is sent before the download, engine-independent.
+ * Same-API-next-candidate before switching APIs: one dead upload is not a
+ * dead API. Pasted soundcloud.com / snd.sc links bypass the YouTube flow
+ * entirely (resolve -> card from SC metadata -> download). The YouTube
+ * flat search runs lazily — only when SoundCloud has failed. Whichever
+ * stage wins, the file is converted to mono 48 kHz Opus/OGG — the format
+ * WhatsApp inline-plays. The metadata card is sent before the download.
  *
  * Video mode (.play -v) still uses yt-dlp directly (songfetch search ->
  * rank -> try-each-candidate loop on MP4 downloads).
@@ -48,6 +47,14 @@ const ffmpegPath = require("ffmpeg-static");
 const { buildTrackCard } = require("../utils/trackCard");
 const { ytdlp, rotatingProxiesActive } = require("../utils/ytdlp");
 const { downloadViaApis } = require("../utils/songApis");
+const {
+  isSoundCloudUrl,
+  extractSoundCloudUrl,
+  resolveSoundCloud,
+  searchSoundCloud,
+  rankSoundCloud,
+  downloadSoundCloudCandidates,
+} = require("../utils/soundcloud");
 const {
   search,
   rank,
@@ -227,7 +234,16 @@ async function play(sock, from, msg, argText) {
 
   if (wantVideo) return playVideo(sock, from, query, say);
 
-  // ── Audio mode: the songfetch.py method via utils/songfetch.js ──
+  // ── Audio mode ──
+  // Chain order (first choice per the SoundCloud write-up):
+  //   cache → SoundCloud (Prexzy SC endpoints) → Knight → Prexzy ytmp3 → yt-dlp.
+  // SoundCloud has no bot check, works from any server IP, and needs no
+  // proxy — so it is stage 1. The YouTube IP cooldown gates ONLY yt-dlp.
+
+  // A pasted SoundCloud link (soundcloud.com/... or snd.sc/...) bypasses
+  // the YouTube flow entirely: resolve it, card from SC metadata, done.
+  const scLink = extractSoundCloudUrl(query);
+  if (scLink) return playSoundCloudLink(sock, from, query, scLink, say);
 
   // songfetch.py's CLI split: "Artist - Title" or `--artist X "X Title"`.
   const { artist, title } = parseArtistTitle(query);
@@ -278,68 +294,107 @@ async function play(sock, from, msg, argText) {
   if (wasCached) {
     await say(`♻️ Cached: *${title}*`);
   } else {
-    // The search happens in the bot (both APIs take a watch URL, not a
-    // song name): songfetch's flat search + rank, same as before.
-    let candidates = [];
-    let searchError = null;
-    try {
-      candidates = rank(await search(query, { limit: 5 }), query);
-    } catch (err) {
-      searchError = err;
-    }
-
-    // API phase — Knight (every candidate), then Prexzy (every candidate).
-    // The same API is retried with the NEXT candidate video before
-    // switching APIs: one dead upload is not a dead API. Each attempt
-    // edits the status message so ~7s-per-attempt doesn't look frozen.
+    // ── Stage 1: SoundCloud (first choice — no bot check, no proxy needed).
+    // The search happens in the bot (the API takes names and links); each
+    // attempt edits the status so nothing looks frozen.
     let apiResult = null;
-    if (candidates.length > 0) {
-      apiResult = await downloadViaApis({
-        candidates,
-        outBase,
-        onAttempt: (label) => say(`${label}...`),
-      });
+    try {
+      const scRows = await searchSoundCloud(query, 8);
+      const rankedSc = rankSoundCloud(scRows, query);
+      if (rankedSc.length > 0) {
+        apiResult = await downloadSoundCloudCandidates({
+          candidates: rankedSc,
+          outBase,
+          onAttempt: (label) => say(`☁️ ${label}...`),
+        });
+      }
+    } catch (scErr) {
+      console.error(
+        "soundcloud stage failed (falling through):",
+        (scErr && scErr.message) || scErr
+      );
     }
 
-    if (apiResult) {
-      await say(`✅ Downloaded via ${apiResult.source} API`);
-    } else {
-      // yt-dlp last resort. The YouTube IP cooldown gates ONLY this path —
-      // the APIs run first even while the server's YouTube route cools down.
-      if (
-        searchError &&
-        /binary not found/i.test(String((searchError && searchError.message) || searchError))
-      ) {
-        return say("⚠️ yt-dlp binary not found — run `npm install` to download it.");
+    // ── Stage 2+3: Knight, then Prexzy ytmp3 — the YouTube-based APIs.
+    // The flat search runs lazily: only now is a video-ID list needed,
+    // so a successful SoundCloud hit skips it entirely.
+    if (!apiResult) {
+      let candidates = [];
+      let searchError = null;
+      try {
+        candidates = rank(await search(query, { limit: 5 }), query);
+      } catch (err) {
+        searchError = err;
       }
-      if (cooldownRemainingMs() > 0) {
-        return say(failureMessage(title));
-      }
-      await say("🌀 Trying yt-dlp fallback...");
-      const imageUrl = trackInfo ? trackInfo.artworkUrl : await lookupCover(artist, title);
-      const got = await downloadTrack({
-        artist,
-        title,
-        album: "",
-        fmt: "mp3",
-        outRoot: CACHE_ROOT,
-        imageUrl,
-        progress: (m) => say(`⏳ ${m}`),
-      });
 
-      if (!got || !fs.existsSync(mp3Path)) {
-        return say(failureMessage(title));
+      // The same API is retried with the NEXT candidate video before
+      // switching APIs: one dead upload is not a dead API.
+      if (candidates.length > 0) {
+        apiResult = await downloadViaApis({
+          candidates,
+          outBase,
+          onAttempt: (label) => say(`${label}...`),
+        });
       }
+
+      if (apiResult) {
+        await say(`✅ Downloaded via ${apiResult.source} API`);
+      } else {
+        // ── Stage 4: yt-dlp last resort. The YouTube IP cooldown gates
+        // ONLY this path — every API stage ran first.
+        if (
+          searchError &&
+          /binary not found/i.test(String((searchError && searchError.message) || searchError))
+        ) {
+          return say("⚠️ yt-dlp binary not found — run `npm install` to download it.");
+        }
+        if (cooldownRemainingMs() > 0) {
+          return say(failureMessage(title));
+        }
+        await say("🌀 Trying yt-dlp fallback...");
+        const imageUrl = trackInfo ? trackInfo.artworkUrl : await lookupCover(artist, title);
+        const got = await downloadTrack({
+          artist,
+          title,
+          album: "",
+          fmt: "mp3",
+          outRoot: CACHE_ROOT,
+          imageUrl,
+          progress: (m) => say(`⏳ ${m}`),
+        });
+
+        if (!got || !fs.existsSync(mp3Path)) {
+          return say(failureMessage(title));
+        }
+      }
+    } else {
+      await say(`✅ Downloaded from SoundCloud${apiResult.author ? ` — ${apiResult.author}` : ""}`);
     }
   }
 
-  // WhatsApp inline-play format (Opus in OGG), cached next to the audio.
-  // The master may be the yt-dlp MP3 or an API .m4a — fluent-ffmpeg reads
-  // the content, not the extension. Re-convert when the master changed.
-  let master = fs.existsSync(mp3Path) ? mp3Path : fs.existsSync(m4aPath) ? m4aPath : null;
+  // Convert + send (shared tail — see convertAndSendAudio).
+  const master = fs.existsSync(mp3Path) ? mp3Path : fs.existsSync(m4aPath) ? m4aPath : null;
   if (!master) {
     return say(failureMessage(title));
   }
+  await convertAndSendAudio(sock, from, albumDir, safeTitle, say);
+}
+
+/**
+ * Shared convert+send tail: finds the master (.mp3 or .m4a) in albumDir,
+ * converts it to WhatsApp Opus/OGG when the cached .ogg is missing or
+ * older than the master, and sends the audio message. The master may be
+ * a yt-dlp MP3, a Knight MP3, or a SoundCloud/Prexzy .m4a — fluent-ffmpeg
+ * reads the content, not the extension.
+ */
+async function convertAndSendAudio(sock, from, albumDir, safeTitle, say) {
+  const mp3Path = path.join(albumDir, `${safeTitle}.mp3`);
+  const m4aPath = path.join(albumDir, `${safeTitle}.m4a`);
+  const oggPath = path.join(albumDir, `${safeTitle}.ogg`);
+
+  const master = fs.existsSync(mp3Path) ? mp3Path : fs.existsSync(m4aPath) ? m4aPath : null;
+  if (!master) throw new Error("no master audio file to convert");
+
   const staleOgg =
     !fs.existsSync(oggPath) ||
     fs.statSync(oggPath).mtimeMs < fs.statSync(master).mtimeMs;
@@ -356,6 +411,77 @@ async function play(sock, from, msg, argText) {
     ptt: false, // false = music message; true = voice-note style
     fileName: `${safeTitle}.ogg`,
   });
+}
+
+/**
+ * Pasted-SoundCloud-link path: resolve → metadata card from SC fields →
+ * download (direct byte link, HLS fallback) → shared convert+send tail.
+ * No YouTube, no iTunes, no proxies involved anywhere.
+ */
+async function playSoundCloudLink(sock, from, query, scLink, say) {
+  await say("☁️ Resolving SoundCloud track...");
+  let track = null;
+  try {
+    track = await resolveSoundCloud(scLink);
+  } catch (err) {
+    console.error("soundcloud resolve failed:", (err && err.message) || err);
+    return say(
+      `❌ Couldn't resolve that SoundCloud link — the track may be private, deleted, or geo-blocked.`
+    );
+  }
+
+  const safeArtist = sanitize(track.author) || "Unknown Artist";
+  const safeTitle = sanitize(track.title) || "Unknown";
+  const albumDir = path.join(CACHE_ROOT, safeArtist, "Unknown Album");
+  fs.mkdirSync(albumDir, { recursive: true });
+  const cardPath = path.join(albumDir, `${safeTitle}.card.png`);
+
+  // Metadata card from the SC response itself (artwork is often present
+  // here, unlike the search rows).
+  try {
+    if (!fs.existsSync(cardPath)) {
+      let coverBuf = null;
+      if (track.artwork) {
+        const res = await fetch(track.artwork, { redirect: "follow" }).catch(() => null);
+        if (res && res.ok) coverBuf = Buffer.from(await res.arrayBuffer());
+      }
+      const png = await buildTrackCard({
+        title: track.title,
+        artist: track.author,
+        album: "",
+        durationMs: track.durationMs || 0,
+        cover: coverBuf,
+      });
+      fs.writeFileSync(cardPath, png);
+    }
+    await sock.sendMessage(from, { image: fs.readFileSync(cardPath) });
+  } catch (cardErr) {
+    console.error("track card failed (continuing):", (cardErr && cardErr.message) || cardErr);
+  }
+
+  const master = fs.existsSync(path.join(albumDir, `${safeTitle}.mp3`))
+    ? path.join(albumDir, `${safeTitle}.mp3`)
+    : fs.existsSync(path.join(albumDir, `${safeTitle}.m4a`))
+      ? path.join(albumDir, `${safeTitle}.m4a`)
+      : null;
+
+  if (master) {
+    await say(`♻️ Cached: *${track.title}*`);
+  } else {
+    const got = await downloadSoundCloudCandidates({
+      candidates: [{ id: track.id, title: track.title, url: scLink }],
+      outBase: path.join(albumDir, safeTitle),
+      onAttempt: (label) => say(`☁️ ${label}...`),
+    });
+    if (!got) {
+      return say(
+        `❌ Couldn't download *${track.title}* from SoundCloud — try again, or use the track name instead of the link.`
+      );
+    }
+    await say("✅ Downloaded from SoundCloud");
+  }
+
+  await convertAndSendAudio(sock, from, albumDir, safeTitle, say);
 }
 
 /**

@@ -86,31 +86,45 @@ commands, or answers it conversationally.
 | `.tulsi mp3 <url>` | Audio extracted via the Tulsi API, sent as an MP3 audio message |
 | `.tulsi mp4 <url>` | 720p MP4 video via the Tulsi API, sent as a video message |
 
-`.play` uses a **four-stage fallback chain**. The search happens in the
-bot (both APIs take a watch URL, not a song name): songfetch's cheap flat
-search (`yt-dlp --flat-playlist ytsearch5:<query>`, top 5 titles, no video
-downloaded) + rank (live/karaoke/cover to the back). Then, in order:
+`.play` audio uses a **five-stage fallback chain**. SoundCloud is the
+first choice: no bot check, works from any server IP (Render included),
+no proxy needed, and a 4-minute track lands as AAC ~160 kbps in ~4 s.
 
 1. **Cache hit** → send immediately.
-2. **Knight API** (`utils/songApis.js`): one GET returns an MP3 already
+2. **SoundCloud** (`utils/soundcloud.js`, Prexzy's SC endpoints): a song
+   name is searched on SoundCloud (`/search/soundcloud`) and the rows are
+   ranked (sped up / slowed + reverb / remix / cover to the back — but a
+   keyword the user searched for is never a penalty), then each candidate
+   goes resolve → byte link (`?id=<id>&mode=audio&quality=hq`; `lq` is
+   accepted when no HQ upload exists) → ftyp+size sanity check. If the
+   byte link fails, the signed HLS playlist is remuxed with
+   `ffmpeg -c copy -bsf:a aac_adtstoasc` (no re-encode). Every URL here
+   carries an `expires=` stamp — only the file is ever stored. A pasted
+   SoundCloud link (`...soundcloud.com/...` or `snd.sc/...`, share-tracking
+   junk stripped) skips the search entirely and uses the track's own
+   metadata for the card.
+3. **Knight API** (`utils/songApis.js`): one GET returns an MP3 already
    sitting on a CDN (`result.download`) — no IP lock, no expiry. Tried
-   with every ranked candidate before switching APIs, because one dead
-   upload is not a dead API (measured: the official Adele upload failed
-   on both APIs while 5 of 6 other uploads worked instantly).
-3. **Prexzy API**: same idea, but the `download_url` is a raw
+   with every ranked YouTube candidate before switching APIs, because one
+   dead upload is not a dead API (measured: the official Adele upload
+   failed on both APIs while 5 of 6 other uploads worked instantly).
+4. **Prexzy API** (YouTube): same idea, but the `download_url` is a raw
    googlevideo.com `.m4a` that **expires within hours** — downloaded
    immediately, the URL never stored. Quality is ~64 kbps in practice,
    which is what WhatsApp gets anyway.
-4. **yt-dlp** (`utils/songfetch.js`, the songfetch.py search-rank-retry
+5. **yt-dlp** (`utils/songfetch.js`, the songfetch.py search-rank-retry
    method): the last resort, and the only stage the server's own IP /
    proxy pool touches. The 300 s YouTube cooldown gates ONLY this stage —
-   the APIs run first even while the YouTube route cools down.
+   every API stage runs first even while the YouTube route cools down.
+
+The YouTube flat search runs lazily — only when the SoundCloud stage has
+failed — so a successful SC hit never pays for it.
 
 Whichever stage won, the audio is converted with `ffmpeg-static` into
 mono 48 kHz Opus in an OGG container — the exact format WhatsApp
 inline-plays (anything else is a tap-to-open document). The metadata
-card (cover art + name/artist/album/duration, from iTunes) is sent
-before the download regardless of which stage serves the file.
+card is sent before the download: iTunes for name queries, the
+SoundCloud response itself for pasted SC links.
 `.play -v <song>` still uses yt-dlp directly (video APIs weren't part of
 the switch), with the same retry logic.
 
