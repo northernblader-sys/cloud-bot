@@ -87,18 +87,23 @@ commands, or answers it conversationally.
 | `.tulsi mp4 <url>` | 720p MP4 video via the Tulsi API, sent as a video message |
 
 `.play` searches YouTube with the `yt-search` package (a plain search-results
-lookup, no login), downloads the audio with the bundled `yt-dlp` binary from
-`youtube-dl-exec`, and re-muxes it with `ffmpeg-static` into mono 48 kHz Opus
+lookup, no login), downloads the audio with the standalone `yt-dlp` binary,
+and re-muxes it with `ffmpeg-static` into mono 48 kHz Opus
 in an OGG container — the exact format WhatsApp inline-plays as an audio
 message (anything else shows up as a tap-to-open document). `.play -v <song>`
 sends the video as a 480p MP4 instead.
 
-Both binaries ship inside their npm packages, so a plain `npm install` is
-enough — no apt, no pip, no Dockerfile changes. That's what makes it work on
-Render's default Node environment. Downloads are cached in `cache/music/`, so
-repeating the same query is instant until the next deploy (Render's disk is
-ephemeral; mount a Render Disk at `./cache` if you want the cache to survive
-redeploys).
+The yt-dlp binary is fetched into `bin/` by `scripts/install-ytdlp.js`, which
+runs automatically on `npm install`. It's yt-dlp's official standalone build
+(the one that embeds its own interpreter), so there's no Python, no apt, no
+pip, no Dockerfile changes — plain `npm install` works on Render's default
+Node environment. (`youtube-dl-exec` was tried first and dropped: its installer
+demands a system Python 3.11+, which Render doesn't ship, and its default
+download is a Python zipapp that would need that interpreter at runtime too.)
+ffmpeg comes from the `ffmpeg-static` npm package. Downloads are cached in
+`cache/music/`, so repeating the same query is instant until the next deploy
+(Render's disk is ephemeral; mount a Render Disk at `./cache` if you want the
+cache to survive redeploys).
 
 Notes:
 

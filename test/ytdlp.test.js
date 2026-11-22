@@ -1,0 +1,227 @@
+// Offline tests for utils/ytdlp.js — the yt-dlp installer/runner that
+// replaced youtube-dl-exec (which needed a system Python 3.11+ and broke
+// the Render build). A local HTTP server stands in for GitHub releases,
+// so nothing here touches the network.
+
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const http = require("node:http");
+const path = require("node:path");
+const os = require("node:os");
+const { existsSync, readFileSync, writeFileSync } = require("node:fs");
+const { mkdtemp, chmod, stat, rm } = require("node:fs/promises");
+
+const { ytdlp, toArgs, assetFor, binPath, installYtDlp } = require(
+  path.join(__dirname, "..", "utils", "ytdlp.js")
+);
+
+test("toArgs converts flags exactly like youtube-dl-exec did", () => {
+  assert.deepEqual(
+    toArgs({
+      extractAudio: true,
+      audioFormat: "opus",
+      audioQuality: 5,
+      noPlaylist: true,
+      noWarnings: true,
+      quiet: true,
+      output: "/tmp/song.raw.opus",
+      ffmpegLocation: "/opt/ffmpeg",
+    }),
+    [
+      "--extract-audio",
+      "--audio-format",
+      "opus",
+      "--audio-quality",
+      "5",
+      "--no-playlist",
+      "--no-warnings",
+      "--quiet",
+      "--output",
+      "/tmp/song.raw.opus",
+      "--ffmpeg-location",
+      "/opt/ffmpeg",
+    ]
+  );
+
+  assert.deepEqual(
+    toArgs({ format: "best[height<=480][ext=mp4]/best", mergeOutputFormat: "mp4" }),
+    ["--format", "best[height<=480][ext=mp4]/best", "--merge-output-format", "mp4"]
+  );
+});
+
+test("assetFor picks the standalone (no-Python) asset per platform", () => {
+  assert.equal(assetFor("linux", "x64"), "yt-dlp_linux");
+  assert.equal(assetFor("linux", "arm64"), "yt-dlp_linux_aarch64");
+  assert.equal(assetFor("darwin", "x64"), "yt-dlp_macos");
+  assert.equal(assetFor("darwin", "arm64"), "yt-dlp_macos");
+  assert.equal(assetFor("win32", "x64"), "yt-dlp.exe");
+  assert.equal(assetFor("win32", "arm64"), "yt-dlp_arm64.exe");
+  assert.throws(() => assetFor("linux", "arm"), /unsupported linux arch/);
+  assert.throws(() => assetFor("sunos", "x64"), /unsupported platform/);
+});
+
+test("binPath honors YT_DLP_PATH and otherwise targets bin/", () => {
+  const before = process.env.YT_DLP_PATH;
+  try {
+    delete process.env.YT_DLP_PATH;
+    const expected = path.join(
+      path.dirname(binPath()),
+      process.platform === "win32" ? "yt-dlp.exe" : "yt-dlp"
+    );
+    assert.equal(binPath(), expected);
+
+    process.env.YT_DLP_PATH = "/custom/yt-dlp";
+    assert.equal(binPath(), "/custom/yt-dlp");
+  } finally {
+    if (before === undefined) delete process.env.YT_DLP_PATH;
+    else process.env.YT_DLP_PATH = before;
+  }
+});
+
+function startServer() {
+  const PAYLOAD = Buffer.alloc(2 * 1024 * 1024, 7); // 2 MB — passes the 1 MB floor
+  const server = http.createServer((req, res) => {
+    if (req.url === "/good") {
+      res.writeHead(200, { "content-type": "application/octet-stream" });
+      return res.end(PAYLOAD);
+    }
+    if (req.url === "/tiny") {
+      // A "successful" response that is far too small to be yt-dlp.
+      res.writeHead(200, { "content-type": "text/html" });
+      return res.end("<html>rate limited</html>");
+    }
+    res.writeHead(404);
+    res.end("nope");
+  });
+  return new Promise((resolve) =>
+    server.listen(0, "127.0.0.1", () =>
+      resolve({ server, base: `http://127.0.0.1:${server.address().port}` })
+    )
+  );
+}
+
+test("installYtDlp downloads the binary, makes it executable, and is idempotent", async () => {
+  const { server, base } = await startServer();
+  const dir = await mkdtemp(path.join(os.tmpdir(), "ytdlp-test-"));
+  try {
+    const first = await installYtDlp({ dir, url: `${base}/good` });
+    assert.equal(first.skipped, false);
+    assert.equal(first.bytes, 2 * 1024 * 1024);
+
+    const dest = path.join(dir, process.platform === "win32" ? "yt-dlp.exe" : "yt-dlp");
+    assert.ok(existsSync(dest), "binary exists at the expected path");
+    assert.ok(!existsSync(`${dest}.part`), "no temp file left behind");
+    const size = (await stat(dest)).size;
+    assert.equal(size, 2 * 1024 * 1024);
+    if (process.platform !== "win32") {
+      const mode = (await stat(dest)).mode & 0o111;
+      assert.ok(mode !== 0, "binary is executable");
+    }
+
+    // Second run must skip (no re-download) and still leave a valid file.
+    const second = await installYtDlp({ dir, url: `${base}/good` });
+    assert.equal(second.skipped, true);
+    assert.equal((await stat(dest)).size, 2 * 1024 * 1024);
+  } finally {
+    server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("installYtDlp rejects HTTP errors and too-small responses", async () => {
+  const { server, base } = await startServer();
+  const dir = await mkdtemp(path.join(os.tmpdir(), "ytdlp-test-"));
+  try {
+    await assert.rejects(
+      () => installYtDlp({ dir, url: `${base}/missing` }),
+      /HTTP 404/
+    );
+    await assert.rejects(
+      () => installYtDlp({ dir, url: `${base}/tiny` }),
+      /looks corrupt/
+    );
+    // Neither failure may leave a binary behind.
+    assert.equal(existsSync(path.join(dir, "yt-dlp")), false);
+  } finally {
+    server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("installYtDlp skips entirely when YT_DLP_PATH is set", async () => {
+  const before = process.env.YT_DLP_PATH;
+  const dir = await mkdtemp(path.join(os.tmpdir(), "ytdlp-test-"));
+  try {
+    process.env.YT_DLP_PATH = "/custom/yt-dlp";
+    const result = await installYtDlp({ dir, url: "http://127.0.0.1:1/never" });
+    assert.equal(result.skipped, true);
+    assert.equal(result.dest, "/custom/yt-dlp");
+    assert.match(result.reason, /YT_DLP_PATH/);
+  } finally {
+    if (before === undefined) delete process.env.YT_DLP_PATH;
+    else process.env.YT_DLP_PATH = before;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("ytdlp rejects with a helpful message when the binary is missing", async () => {
+  await assert.rejects(
+    () => ytdlp("https://example.com/v", {}, { bin: "/nonexistent/yt-dlp" }),
+    /yt-dlp binary not found/
+  );
+});
+
+test("ytdlp spawns the binary, passes args, and resolves stdout", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("fake binary uses a shebang");
+    return;
+  }
+  const dir = await mkdtemp(path.join(os.tmpdir(), "ytdlp-test-"));
+  const fake = path.join(dir, "fake-yt-dlp");
+  writeFileSync(
+    fake,
+    "#!/usr/bin/env node\n" +
+      "const args = process.argv.slice(2);\n" +
+      "if (args.includes('--fail')) { console.error('HTTP 402 refused'); process.exit(1); }\n" +
+      "console.log(JSON.stringify({ args }));\n"
+  );
+  await chmod(fake, 0o755);
+  try {
+    const out = await ytdlp("https://youtu.be/abc", { audioFormat: "opus", quiet: true }, { bin: fake });
+    assert.deepEqual(out.args, [
+      "--audio-format",
+      "opus",
+      "--quiet",
+      "--",
+      "https://youtu.be/abc",
+    ]);
+
+    await assert.rejects(
+      () => ytdlp("https://youtu.be/abc", { fail: true }, { bin: fake }),
+      /HTTP 402 refused/
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("ytdlp kills a hung binary at the timeout", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("fake binary uses a shebang");
+    return;
+  }
+  const dir = await mkdtemp(path.join(os.tmpdir(), "ytdlp-test-"));
+  const fake = path.join(dir, "slow-yt-dlp");
+  writeFileSync(fake, "#!/usr/bin/env node\nsetTimeout(() => {}, 60000);\n");
+  await chmod(fake, 0o755);
+  try {
+    const started = Date.now();
+    await assert.rejects(
+      () => ytdlp("https://youtu.be/abc", {}, { bin: fake, timeoutMs: 300 }),
+      /timed out after/
+    );
+    assert.ok(Date.now() - started < 5000, "rejected promptly, not after 60s");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
