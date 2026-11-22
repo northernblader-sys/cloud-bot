@@ -331,3 +331,171 @@ test("ytdlp injects --proxy from YT_DLP_PROXY; opts.proxy overrides and '' disab
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+// ── proxy pool: rotation per call + benching ────────────────────────────────
+
+const {
+  parseProxyList,
+  rotatingProxiesActive,
+  proxyPool,
+  nextProxy,
+  proxyBenchRemaining,
+  penalizeProxy,
+  resetProxyPool,
+} = require(path.join(__dirname, "..", "utils", "ytdlp.js"));
+
+function withProxyEnv( { list, single, benchMs } = {}) {
+  const before = {
+    LIST: process.env.YT_DLP_PROXY_LIST,
+    SINGLE: process.env.YT_DLP_PROXY,
+    BENCH: process.env.YT_DLP_PROXY_BENCH_MS,
+  };
+  resetProxyPool();
+  if (list === undefined) delete process.env.YT_DLP_PROXY_LIST;
+  else process.env.YT_DLP_PROXY_LIST = list;
+  if (single === undefined) delete process.env.YT_DLP_PROXY;
+  else process.env.YT_DLP_PROXY = single;
+  if (benchMs === undefined) delete process.env.YT_DLP_PROXY_BENCH_MS;
+  else process.env.YT_DLP_PROXY_BENCH_MS = String(benchMs);
+  return () => {
+    if (before.LIST === undefined) delete process.env.YT_DLP_PROXY_LIST;
+    else process.env.YT_DLP_PROXY_LIST = before.LIST;
+    if (before.SINGLE === undefined) delete process.env.YT_DLP_PROXY;
+    else process.env.YT_DLP_PROXY = before.SINGLE;
+    if (before.BENCH === undefined) delete process.env.YT_DLP_PROXY_BENCH_MS;
+    else process.env.YT_DLP_PROXY_BENCH_MS = before.BENCH;
+    resetProxyPool();
+  };
+}
+
+test("parseProxyList splits commas, newlines, semicolons and dedupes", () => {
+  assert.deepEqual(
+    parseProxyList("http://u:p@1.1.1.1:6014,\nhttp://u:p@2.2.2.2:6641 ; http://u:p@1.1.1.1:6014"),
+    ["http://u:p@1.1.1.1:6014", "http://u:p@2.2.2.2:6641"]
+  );
+  assert.deepEqual(parseProxyList(""), []);
+  assert.deepEqual(parseProxyList(null), []);
+});
+
+test("rotatingProxiesActive is true only for 2+ proxies", () => {
+  const undo = withProxyEnv( { list: "http://u:p@a:1,http://u:p@b:2" });
+  try {
+    assert.equal(rotatingProxiesActive(), true);
+    assert.equal(proxyPool().length, 2);
+  } finally {
+    undo();
+  }
+
+  const undoSingle = withProxyEnv( { single: "http://u:p@a:1" });
+  try {
+    assert.equal(rotatingProxiesActive(), false, "single proxy is not a rotating pool");
+    assert.deepEqual(proxyPool(), ["http://u:p@a:1"]);
+  } finally {
+    undoSingle();
+  }
+
+  const undoNone = withProxyEnv( {});
+  try {
+    assert.equal(rotatingProxiesActive(), false);
+    assert.deepEqual(proxyPool(), []);
+  } finally {
+    undoNone();
+  }
+});
+
+test("proxy pool rotates per call: a, b, c, then back to a", () => {
+  const undo = withProxyEnv( { list: "http://u:p@a:1, http://u:p@b:2, http://u:p@c:3" });
+  try {
+    assert.deepEqual([nextProxy(), nextProxy(), nextProxy(), nextProxy()], [
+      "http://u:p@a:1",
+      "http://u:p@b:2",
+      "http://u:p@c:3",
+      "http://u:p@a:1",
+    ]);
+  } finally {
+    undo();
+  }
+});
+
+test("a failed proxy is benched and skipped; YT_DLP_PROXY_LIST wins over YT_DLP_PROXY", () => {
+  const undo = withProxyEnv( {
+    list: "http://u:p@a:1,http://u:p@b:2",
+    benchMs: 10000,
+  });
+  try {
+    // First call gets a; it dies at the transport level -> benched.
+    const a = nextProxy();
+    assert.equal(penalizeProxy(a, new Error("ERROR: unable to connect to proxy")), true);
+    assert.ok(proxyBenchRemaining(a) > 0);
+    // Next picks b, then wraps to... a is still benched -> b again.
+    assert.equal(nextProxy(), "http://u:p@b:2");
+    assert.equal(nextProxy(), "http://u:p@b:2");
+    // A bot-check on b's IP also benches it (reputation fault).
+    assert.equal(penalizeProxy("http://u:p@b:2", new Error("Sign in to confirm you're not a bot")), true);
+    // All benched -> rotation falls back to the cursor entry anyway.
+    assert.ok([a, "http://u:p@b:2"].includes(nextProxy()));
+  } finally {
+    undo();
+  }
+});
+
+test("content failures (private video) do NOT bench a proxy", () => {
+  const undo = withProxyEnv( { list: "http://u:p@a:1,http://u:p@b:2", benchMs: 10000 });
+  try {
+    const a = nextProxy();
+    assert.equal(
+      penalizeProxy(a, new Error("ERROR: [youtube] x: Private video. Sign in if you've been granted access")),
+      false
+    );
+    assert.equal(proxyBenchRemaining(a), 0);
+  } finally {
+    undo();
+  }
+});
+
+test("bench window expires and the proxy rejoins the rotation", async () => {
+  const undo = withProxyEnv( { list: "http://u:p@a:1,http://u:p@b:2", benchMs: 40 });
+  try {
+    const a = nextProxy();
+    penalizeProxy(a, new Error("ECONNREFUSED 1.2.3.4"));
+    assert.ok(proxyBenchRemaining(a) > 0);
+    await new Promise((r) => setTimeout(r, 60));
+    assert.equal(proxyBenchRemaining(a), 0, "bench expired");
+  } finally {
+    undo();
+  }
+});
+
+test("ytdlp calls rotate through the pool (observed via fake binary)", async () => {
+  if (process.platform === "win32") {
+    t2.skip("fake binary uses a shebang");
+    return;
+  }
+  const undo = withProxyEnv( { list: "http://u:p@a:1,http://u:p@b:2" });
+  const dir = await mkdtemp(path.join(os.tmpdir(), "ytdlp-test-"));
+  const fake = path.join(dir, "rot-yt-dlp");
+  writeFileSync(
+    fake,
+    "#!/usr/bin/env node\n" +
+      "const args = process.argv.slice(2);\n" +
+      "const i = args.indexOf('--proxy');\n" +
+      "console.log(JSON.stringify({ proxy: i === -1 ? null : args[i + 1] }));\n"
+  );
+  await chmod(fake, 0o755);
+  try {
+    const seen = [];
+    for (let i = 0; i < 4; i++) {
+      const out = await ytdlp("https://youtu.be/abc", {}, { bin: fake });
+      seen.push(out.proxy);
+    }
+    assert.deepEqual(seen, [
+      "http://u:p@a:1",
+      "http://u:p@b:2",
+      "http://u:p@a:1",
+      "http://u:p@b:2",
+    ]);
+  } finally {
+    undo();
+    await rm(dir, { recursive: true, force: true });
+  }
+});

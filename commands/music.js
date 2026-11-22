@@ -48,7 +48,7 @@ const path = require("path");
 const ffmpeg = require("fluent-ffmpeg");
 const ffmpegPath = require("ffmpeg-static");
 const { buildTrackCard } = require("../utils/trackCard");
-const { ytdlp } = require("../utils/ytdlp");
+const { ytdlp, rotatingProxiesActive } = require("../utils/ytdlp");
 const {
   search,
   rank,
@@ -85,6 +85,13 @@ function failureMessage(what) {
   const info = lastFailureInfo();
   const kind = info && info.kind;
   if (kind === "botcheck" || kind === "ratelimit") {
+    if (rotatingProxiesActive()) {
+      return (
+        `🚫 YouTube flagged one of the proxy IPs while fetching *${what}*.\n` +
+        "That IP is benched for 10 min and the next ones get tried automatically.\n" +
+        "If this keeps failing, refresh the proxy list (YT_DLP_PROXY_LIST)."
+      );
+    }
     const mins = Math.max(1, Math.ceil(cooldownRemainingMs() / 60000));
     return (
       `🚫 YouTube is rate-limiting this server's IP${kind === "ratelimit" ? " (HTTP 429)" : " (bot check)"}.\n` +
@@ -358,10 +365,12 @@ async function playVideo(sock, from, query, say) {
             // ignore
           }
         }
-        // A bot check / 429 means the IP is flagged: stop the loop, the
-        // cooldown will make the next .play fail fast with a clear message.
+        // A bot check / 429 means the current IP is flagged: stop the
+        // loop (the cooldown will fail fast the next .play) — unless a
+        // rotating proxy pool is active, where the next candidate uses a
+        // different IP and is worth trying.
         const kind = classifyError(err);
-        if (kind === "botcheck" || kind === "ratelimit") break;
+        if ((kind === "botcheck" || kind === "ratelimit") && !rotatingProxiesActive()) break;
       }
     }
 

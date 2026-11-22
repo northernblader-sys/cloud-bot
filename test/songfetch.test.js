@@ -527,3 +527,85 @@ test("a blocked search skips the one-shot fallback (no hammering)", async () => 
     clearCooldown();
   }
 });
+
+// ── rotating proxy pool: the global cooldown applies only to single-IP setups ──
+
+const { resetProxyPool } = require(path.join(__dirname, "..", "utils", "ytdlp.js"));
+
+function withProxyList( list) {
+  const before = process.env.YT_DLP_PROXY_LIST;
+  resetProxyPool();
+  if (list === undefined) delete process.env.YT_DLP_PROXY_LIST;
+  else process.env.YT_DLP_PROXY_LIST = list;
+  return () => {
+    if (before === undefined) delete process.env.YT_DLP_PROXY_LIST;
+    else process.env.YT_DLP_PROXY_LIST = before;
+    resetProxyPool();
+  };
+}
+
+test("with a rotating pool, a bot check benches the proxy but skips the 300s cooldown", async () => {
+  clearCooldown();
+  const undo = withProxyList( "http://u:p@a:1,http://u:p@b:2");
+  const outRoot = await mkdtemp(path.join(os.tmpdir(), "songfetch-test-"));
+  try {
+    // Candidate 1 rides proxy a and gets bot-checked; candidate 2 rides
+    // proxy b and fails ordinarily. Rotation must keep going (2 attempts)
+    // and the global cooldown must NOT start.
+    const tried = [];
+    const searchImpl = async () =>
+      [1, 2].map((n) => ({ id: String(n), title: `Song ${n}`, url: `https://www.youtube.com/watch?v=${n}` }));
+    let call = 0;
+    const result = await downloadTrack({
+      artist: "",
+      title: "Song",
+      outRoot,
+      searchImpl,
+      ytdlpImpl: async (target) => {
+        tried.push(target);
+        call++;
+        throw new Error(
+          call === 1
+            ? "ERROR: Sign in to confirm you're not a bot"
+            : "ERROR: [youtube] 2: Video unavailable"
+        );
+      },
+      ffmpegImpl: async () => 0,
+      fetchImpl: async () => ({ ok: false }),
+      attemptGapMs: 0,
+    });
+    assert.equal(result, null);
+    assert.equal(tried.length, 2, "rotation kept trying the next IP");
+    assert.equal(cooldownRemainingMs(), 0, "no global cooldown while rotating");
+    assert.equal(lastFailureInfo().kind, "unavailable", "last failure was candidate 2's");
+  } finally {
+    undo();
+    await rm(outRoot, { recursive: true, force: true });
+    clearCooldown();
+  }
+});
+
+test("with a single proxy (no rotation), the cooldown still applies", async () => {
+  clearCooldown();
+  const undo = withProxyList( "http://u:p@a:1");
+  const outRoot = await mkdtemp(path.join(os.tmpdir(), "songfetch-test-"));
+  try {
+    await downloadTrack({
+      artist: "",
+      title: "Song",
+      outRoot,
+      searchImpl: async () => [{ id: "1", title: "Song", url: "https://www.youtube.com/watch?v=1" }],
+      ytdlpImpl: async () => {
+        throw new Error("ERROR: Sign in to confirm you're not a bot");
+      },
+      ffmpegImpl: async () => 0,
+      fetchImpl: async () => ({ ok: false }),
+      attemptGapMs: 0,
+    });
+    assert.ok(cooldownRemainingMs() > 0, "single proxy = one IP = cooldown applies");
+  } finally {
+    undo();
+    await rm(outRoot, { recursive: true, force: true });
+    clearCooldown();
+  }
+});

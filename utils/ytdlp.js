@@ -27,11 +27,13 @@
  * the next `npm install` or bot start; if the refresh fails, the
  * existing binary is kept — an outdated yt-dlp beats no yt-dlp.
  *
- * Outbound proxy: when `YT_DLP_PROXY` is set (e.g. `socks5h://user:pass@
- * host:1080`), every yt-dlp call goes through it and WhatsApp traffic
- * stays direct. This is the escape hatch for a flagged datacenter IP —
- * see README "If the IP stays blocked" for endpoint options (WARP, a
- * cheap VPS, a residential proxy service, a home exit node).
+ * Outbound proxy: when `YT_DLP_PROXY` (single) or `YT_DLP_PROXY_LIST`
+ * (several, comma/newline-separated) is set, yt-dlp traffic goes through
+ * it and WhatsApp traffic stays direct. With several proxies the pool
+ * *rotates per call* — each search/candidate attempt rides the next IP —
+ * and a proxy that fails (dead endpoint, or YouTube flagged its IP) is
+ * benched for 10 minutes (`YT_DLP_PROXY_BENCH_MS`) so the rest keep
+ * working. See README "If the IP stays blocked" for endpoint options.
  */
 
 const fs = require("fs");
@@ -193,13 +195,118 @@ async function installYtDlp({
 }
 
 /**
- * Outbound proxy for yt-dlp traffic only. Resolution order: per-call
- * `opts.proxy` (tests / callers; "" disables), then `$YT_DLP_PROXY`.
- * Returns "" when no proxy is configured — yt-dlp connects directly.
+ * Outbound proxy support for yt-dlp traffic only.
+ *
+ * Sources: `YT_DLP_PROXY_LIST` (comma/newline/semicolon-separated
+ * Webshare-style URLs, e.g. `http://user:pass@host:port`) or the older
+ * single `YT_DLP_PROXY` (which now also accepts a list). Per-call
+ * `opts.proxy` overrides both ("" disables), which is what tests use.
+ *
+ * With 2+ proxies configured the pool rotates per yt-dlp call: each
+ * search and each candidate download gets the next IP, spreading the
+ * request rate across the pool. A proxy whose call fails at the
+ * transport level (connection refused/auth/tunnel/timeout) or whose IP
+ * YouTube flags (bot check / 429) is *benched* for
+ * `YT_DLP_PROXY_BENCH_MS` (default 10 min) — the rotation skips it and
+ * the rest keep working. While rotation is active, the 300 s global
+ * YouTube cooldown does NOT apply (each call uses a different IP, so
+ * one flagged proxy shouldn't stall the others); with a single proxy
+ * or a direct connection it does, exactly as before.
+ */
+
+const PROXY_BENCH_MS_DEFAULT = 10 * 60 * 1000;
+
+let proxyCursor = 0;
+const benchedProxies = new Map(); // proxy URL -> bench-until timestamp (ms)
+
+/** Split a raw env value into a deduped proxy URL list. */
+function parseProxyList(raw) {
+  const parts = String(raw || "")
+    .split(/[\s,;]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return [...new Set(parts)];
+}
+
+/** The configured pool: YT_DLP_PROXY_LIST, falling back to YT_DLP_PROXY. */
+function proxyPool() {
+  let pool = parseProxyList(process.env.YT_DLP_PROXY_LIST);
+  if (pool.length === 0) pool = parseProxyList(process.env.YT_DLP_PROXY);
+  return pool;
+}
+
+function benchMs() {
+  const n = Number(process.env.YT_DLP_PROXY_BENCH_MS);
+  return Number.isFinite(n) && n >= 0 ? n : PROXY_BENCH_MS_DEFAULT;
+}
+
+/**
+ * Transport-level (dead/wrong endpoint) and IP-reputation (bot check /
+ * 429) failures are the proxy's fault; content failures ("private
+ * video", age-restricted, format) are not — benching for those would
+ * eventually bench every healthy proxy for nothing.
+ */
+const PROXY_FAULT_RE =
+  /econnrefused|econnreset|etimedout|eproto|enotfound|getaddrinfo|socket hang up|unable to connect to (proxy|host)|proxy (connect|authentication|error)|tunnel|http error 407|timed out after/i;
+const PROXY_REPUTATION_RE = /sign in to confirm|not a bot|http error 429|too many requests/i;
+
+function isProxyFault(err) {
+  const msg = String((err && err.message) || err || "");
+  return PROXY_FAULT_RE.test(msg) || PROXY_REPUTATION_RE.test(msg);
+}
+
+/** Bench a proxy after one of its calls failed. Returns true if benched. */
+function penalizeProxy(proxy, err) {
+  if (!proxy || !isProxyFault(err)) return false;
+  benchedProxies.set(proxy, Date.now() + benchMs());
+  return true;
+}
+
+/** Milliseconds this proxy is still benched for (0 = usable). */
+function proxyBenchRemaining(proxy) {
+  return Math.max(0, (benchedProxies.get(proxy) || 0) - Date.now());
+}
+
+/** Next proxy in the pool, skipping benched ones (round-robin per call). */
+function nextProxy() {
+  const pool = proxyPool();
+  if (pool.length === 0) return "";
+  for (let i = 0; i < pool.length; i++) {
+    const cand = pool[(proxyCursor + i) % pool.length];
+    if (proxyBenchRemaining(cand) === 0) {
+      proxyCursor = (proxyCursor + i + 1) % pool.length;
+      return cand;
+    }
+  }
+  // Every proxy is benched — rotate anyway: bench windows expire, and
+  // a possibly-recovered proxy beats a dead bot.
+  const cand = pool[proxyCursor % pool.length];
+  proxyCursor = (proxyCursor + 1) % pool.length;
+  return cand;
+}
+
+/** True when 2+ proxies are configured (rotation + no global cooldown). */
+function rotatingProxiesActive() {
+  return proxyPool().length > 1;
+}
+
+/** Forget benches and the cursor (admin escape hatch; used by tests). */
+function resetProxyPool() {
+  proxyCursor = 0;
+  benchedProxies.clear();
+}
+
+/**
+ * The proxy for one yt-dlp call. Resolution order: per-call `opts.proxy`
+ * (tests / callers; "" disables), then the configured pool. Returns ""
+ * when nothing is configured — yt-dlp connects directly.
  */
 function proxyArg(opts = {}) {
   if (opts.proxy !== undefined) return String(opts.proxy || "");
-  return process.env.YT_DLP_PROXY || "";
+  const pool = proxyPool();
+  if (pool.length === 0) return "";
+  if (pool.length === 1) return pool[0];
+  return nextProxy();
 }
 
 /**
@@ -229,8 +336,7 @@ function ytdlp(url, flags = {}, opts = {}) {
   if (proxy) {
     args.push("--proxy", proxy);
   }
-  args.push("--", url);
-  const timeoutMs =
+  args.push("--", url);  const timeoutMs =
     opts.timeoutMs !== undefined
       ? opts.timeoutMs
       : process.env.YTDLP_TIMEOUT_MS
@@ -247,7 +353,9 @@ function ytdlp(url, flags = {}, opts = {}) {
       timeoutMs > 0
         ? setTimeout(() => {
             child.kill("SIGKILL");
-            settle(new Error(`yt-dlp timed out after ${Math.round(timeoutMs / 1000)}s`));
+            const err = new Error(`yt-dlp timed out after ${Math.round(timeoutMs / 1000)}s`);
+            penalizeProxy(proxy, err); // a hang is usually a dead/slow proxy
+            settle(err);
           }, timeoutMs)
         : null;
 
@@ -268,7 +376,9 @@ function ytdlp(url, flags = {}, opts = {}) {
     child.on("error", (err) => settle(err));
     child.on("close", (code) => {
       if (code !== 0) {
-        settle(new Error(stderr.trim() || `yt-dlp exited with code ${code}`));
+        const err = new Error(stderr.trim() || `yt-dlp exited with code ${code}`);
+        penalizeProxy(proxy, err);
+        settle(err);
         return;
       }
       const out = stdout.trim();
@@ -291,8 +401,18 @@ module.exports = {
   binPath,
   assetFor,
   installYtDlp,
+  parseProxyList,
+  proxyPool,
+  proxyArg,
+  nextProxy,
+  penalizeProxy,
+  proxyBenchRemaining,
+  rotatingProxiesActive,
+  resetProxyPool,
+  isProxyFault,
   BIN_DIR,
   RELEASE_BASE,
   MIN_BINARY_BYTES,
   DEFAULT_MAX_AGE_HOURS,
+  PROXY_BENCH_MS_DEFAULT,
 };

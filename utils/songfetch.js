@@ -57,7 +57,7 @@ const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
 
-const { ytdlp } = require("./ytdlp");
+const { ytdlp, rotatingProxiesActive } = require("./ytdlp");
 
 const YT_SEARCH_TIMEOUT_MS = 20 * 1000;
 const TRACK_DL_TIMEOUT_MS = 600 * 1000;
@@ -182,14 +182,21 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 let cooldownUntil = 0;
 let lastFailure = null; // { kind, detail, at } — the most recent attempt's cause
 
-/** Record a failure's cause; starts the 300 s cooldown on bot check / 429. */
+/**
+ * Record a failure's cause; starts the 300 s cooldown on bot check / 429.
+ * The cooldown models music-seeker's single-IP world: the SAME address
+ * must rest. When a rotating proxy pool is active, each call already
+ * rides a different IP — the runner benches the offending proxy and the
+ * global cooldown would needlessly stall the healthy ones, so it is
+ * skipped (single proxy or direct connection: cooldown applies as ever).
+ */
 function noteFailure(err) {
   const kind = classifyError(err);
   const detail = String((err && err.message) || err || "")
     .split("\n")
     .find((line) => line.trim()) || "";
   lastFailure = { kind, detail: detail.trim().slice(0, 200), at: Date.now() };
-  if (kind === "botcheck" || kind === "ratelimit") {
+  if ((kind === "botcheck" || kind === "ratelimit") && !rotatingProxiesActive()) {
     cooldownUntil = Date.now() + YT_COOLDOWN_MS;
   }
   return lastFailure;
@@ -479,9 +486,12 @@ async function downloadTrack(opts = {}) {
     } catch (err) {
       noteFailure(err);
       const kind = classifyError(err);
-      // A bot check / 429 means the server's IP is flagged: further
-      // candidates only extend the block, so tell the caller to stop.
-      blocked = kind === "botcheck" || kind === "ratelimit";
+      // A bot check / 429 means the current IP is flagged: further
+      // candidates on the SAME IP only extend the block, so tell the
+      // caller to stop. With a rotating proxy pool the next candidate
+      // rides a different IP — keep going (the runner benched the bad one).
+      blocked =
+        (kind === "botcheck" || kind === "ratelimit") && !rotatingProxiesActive();
       // Fall through: success is "does the file exist", not exit code.
     }
     if (fs.existsSync(finalFile)) return { ok: true, blocked: false };
