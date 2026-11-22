@@ -86,12 +86,18 @@ commands, or answers it conversationally.
 | `.tulsi mp3 <url>` | Audio extracted via the Tulsi API, sent as an MP3 audio message |
 | `.tulsi mp4 <url>` | 720p MP4 video via the Tulsi API, sent as a video message |
 
-`.play` searches YouTube with the `yt-search` package (a plain search-results
-lookup, no login), downloads the audio with the standalone `yt-dlp` binary,
-and re-muxes it with `ffmpeg-static` into mono 48 kHz Opus
-in an OGG container — the exact format WhatsApp inline-plays as an audio
-message (anything else shows up as a tap-to-open document). `.play -v <song>`
-sends the video as a 480p MP4 instead.
+`.play` uses the search-rank-retry method from `songfetch.py` (ported to
+Node in `utils/songfetch.js`): it searches YouTube cheaply once with
+`yt-dlp --flat-playlist ytsearch5:<query>` (top 5 titles, no video
+downloaded yet), ranks them so live/karaoke/cover versions go to the
+back, then tries each candidate in order until a file actually appears
+on disk — leftover `.part` files are deleted between attempts so one
+song never becomes two videos stitched together. The audio is then
+re-muxed with `ffmpeg-static` into mono 48 kHz Opus in an OGG container
+— the exact format WhatsApp inline-plays as an audio message (anything
+else shows up as a tap-to-open document). `.play -v <song>` sends the
+video as a 480p MP4 instead, with the same retry logic. (`yt-search` is
+kept only as a fallback when the flat search comes back empty.)
 
 The yt-dlp binary is fetched into `bin/` by `scripts/install-ytdlp.js`, which
 runs automatically on `npm install`. It's yt-dlp's official standalone build
@@ -110,9 +116,17 @@ Notes:
 - Tracks over 10 minutes are rejected up front (a 3-hour mix would stall the
   bot).
 - `.play` with no query just prints usage.
-- The download path runs `yt-dlp` against YouTube directly, so if YouTube
-  starts showing a bot check to your server's IP, the error surfaces in the
-  chat ("Download failed...") rather than failing silently.
+- Bot check ("Sign in to confirm you're not a bot"): YouTube flags
+  datacenter IPs. Every download already carries an android/ios player
+  client plus retries (`ytdlpBaseFlags()` in `utils/ytdlp.js`), which
+  gets past it on most servers. If it still fails, export your YouTube
+  cookies as `cookies.txt` (Netscape format) from a browser signed into
+  YouTube, drop it in the repo root (or set `YT_DLP_COOKIES=/path/to/cookies.txt`),
+  and retry — the bot's error message walks you through it. Cookies
+  expire, so re-export fresh ones if it stops working. Override the
+  player client with `YT_DLP_PLAYER_CLIENT` (e.g. `android`) or the full
+  `YT_DLP_EXTRACTOR_ARGS`. Timeouts are tunable via
+  `YTDLP_SEARCH_TIMEOUT_MS` / `YTDLP_TRACK_TIMEOUT_MS`.
 
 `.tiktok`/`.ig`/`.pinterest`/`.fb` use tikwm.com and api-faa.my.id. Those are third-party scraper APIs, not official platform APIs — they can change or go down without notice. If one stops working, the fix is updating the relevant fetch function in `utils/downloaders/fetchers.js`.
 
