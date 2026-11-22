@@ -16,12 +16,9 @@
  * binary to `bin/`; this module spawns it using the same dargs flag
  * conversion youtube-dl-exec used, so call sites behave identically.
  *
- * Bot-check handling (see utils/songfetch.js for the search-rank-retry
- * flow that uses this runner): YouTube flags datacenter IPs with
- * "Sign in to confirm you're not a bot". `ytdlpBaseFlags()` adds the
- * mitigations that work without a browser — an android/ios player
- * client, retries, and an optional cookies file — and
- * `isBotCheckError()` lets callers show the user how to fix it.
+ * The `.play` download method itself lives in `utils/songfetch.js`
+ * (search-rank-retry, ported from songfetch.py). This module is just
+ * the binary installer + process runner.
  */
 
 const fs = require("fs");
@@ -35,59 +32,6 @@ const BIN_DIR = path.join(__dirname, "..", "bin");
 // it's an HTML/JSON error page or a truncated download.
 const MIN_BINARY_BYTES = 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
-
-// Default player clients for YouTube. The `web` client needs a PO token
-// from datacenter IPs and gets the "Sign in to confirm you're not a bot"
-// wall; `android`/`ios` usually don't. Order matters: yt-dlp tries them
-// left to right. Override with YT_DLP_PLAYER_CLIENT (e.g. "android") or
-// YT_DLP_EXTRACTOR_ARGS (full value, e.g. "youtube:player_client=web").
-const DEFAULT_PLAYER_CLIENT = "android,ios,web";
-
-/**
- * Where yt-dlp should read cookies from, if anywhere.
- * Priority: $YT_DLP_COOKIES, then ./cookies.txt in the repo root.
- * Returns null when no file exists — anonymous downloads still work
- * on most IPs, cookies are only needed once YouTube flags the server.
- */
-function cookiePath() {
-  if (process.env.YT_DLP_COOKIES) {
-    return process.env.YT_DLP_COOKIES;
-  }
-  const local = path.join(__dirname, "..", "cookies.txt");
-  try {
-    if (fs.existsSync(local)) return local;
-  } catch {
-    // ignore — fall through to no cookies
-  }
-  return null;
-}
-
-/**
- * Flags every YouTube download should carry: player client, retries,
- * socket timeout, and cookies when a file is configured. Merge these
- * into the per-call flags (spread first, so call-site values win).
- */
-function ytdlpBaseFlags() {
-  const flags = {
-    extractorArgs:
-      process.env.YT_DLP_EXTRACTOR_ARGS ||
-      `youtube:player_client=${process.env.YT_DLP_PLAYER_CLIENT || DEFAULT_PLAYER_CLIENT}`,
-    retries: 3,
-    fragmentRetries: 3,
-    socketTimeout: 30,
-  };
-  const cookies = cookiePath();
-  if (cookies) flags.cookies = cookies;
-  return flags;
-}
-
-/** True when an error looks like YouTube's bot wall (needs cookies). */
-function isBotCheckError(err) {
-  const msg = String((err && err.message) || err || "");
-  return /sign in to confirm|not a bot|use --cookies|po token|player.*response|nsig|n challenge|requested format is not available/i.test(
-    msg
-  );
-}
 
 /** Where the yt-dlp binary lives. YT_DLP_PATH overrides for custom setups. */
 function binPath(platform = process.platform) {
@@ -277,11 +221,7 @@ module.exports = {
   binPath,
   assetFor,
   installYtDlp,
-  ytdlpBaseFlags,
-  cookiePath,
-  isBotCheckError,
   BIN_DIR,
   RELEASE_BASE,
   MIN_BINARY_BYTES,
-  DEFAULT_PLAYER_CLIENT,
 };
