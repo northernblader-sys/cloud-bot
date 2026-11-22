@@ -7,20 +7,23 @@
  * return a download URL for a file sitting on someone else's CDN, so a
  * flagged datacenter IP (Render) or dead proxy doesn't matter for them.
  *
- *   1. Prexzy  — GET {PREXZY_API_URL}/download/ytmp3?url=<watch url>
- *                -> { status, info: {...}, download_url }
- *                `download_url` is a raw googlevideo.com link (.m4a) that
- *                EXPIRES within hours — download it immediately and never
- *                store the URL. Response body is ~10 KB; never log it whole.
- *   2. Knight  — GET {KNIGHT_API_URL}/api/download/ytaudio
+ *   1. Knight  — GET {KNIGHT_API_URL}/api/download/ytaudio
  *                ?format=128kbps&apikey=knight&url=<watch url>
  *                -> { success, result: { title, id, download } }
  *                `download` is an MP3 on savetube.vip's CDN: no IP lock,
  *                no expiry. apikey=knight is the free shared key from
  *                KnightBot's public repo — not a secret.
+ *   2. Prexzy  — GET {PREXZY_API_URL}/download/ytmp3?url=<watch url>
+ *                -> { status, info: {...}, download_url }
+ *                `download_url` is a raw googlevideo.com link (.m4a) that
+ *                EXPIRES within hours — download it immediately and never
+ *                store the URL. Response body is ~10 KB; never log it whole.
  *
- * (The caller can reorder via downloadViaApis()'s `order` option; the
- * current chain puts Prexzy first, then Knight, then SoundCloud.)
+ * Chat labels are generic on purpose — the user asked to never show the
+ * API service names: stages appear as "API 1", "API 2", ... following the
+ * chain order (API 1 = Knight, API 2 = Prexzy). The mapping lives in the
+ * README only. The caller can reorder via downloadViaApis()'s `order`
+ * option; the numbering follows whatever order is active.
  *
  * The same API is retried with the NEXT candidate video before switching
  * APIs — one dead upload is not a dead API (measured: the official Adele
@@ -198,26 +201,29 @@ async function downloadTo(
  * The API phase of the fallback chain: every candidate through the FIRST
  * API (same API, next video ID), then every candidate through the second,
  * then give up (caller falls back further). `opts.order` picks which API
- * goes first — default ["prexzy", "knight"] (Prexzy first, per the user).
+ * goes first — default ["knight", "prexzy"] (Knight first, per the user).
+ * Chat labels are generic: "API 1", "API 2" — never the service names.
  *
  * @param {object} opts
  * @param {Array<{id,title,url}>} opts.candidates  ranked search results
  * @param {string} opts.outBase        output path WITHOUT extension;
  *                                     writes `<outBase>.mp3` (Knight) or
  *                                     `<outBase>.m4a` (Prexzy)
- * @param {Array<"prexzy"|"knight">} [opts.order] API priority
+ * @param {Array<"knight"|"prexzy">} [opts.order] API priority
  * @param {Function} [opts.onAttempt]  called with a short label before
  *                                     each attempt (chat status edits)
  * @param {Function} [opts.fetchImpl]  injection point for tests
  * @param {number} [opts.apiTimeoutMs] per API request (default 25 s —
  *                                     Knight takes ~7 s even to fail)
  * @param {number} [opts.downloadTimeoutMs] per file download (default 120 s)
- * @returns {Promise<{path, source, title}|null>} null when every attempt failed
+ * @returns {Promise<{path, source, apiNo, title, thumbnail, author}|null>}
+ *   null when every attempt failed; apiNo is the 1-based chain position
+ *   for the generic chat labels.
  */
 async function downloadViaApis({
   candidates,
   outBase,
-  order = ["prexzy", "knight"],
+  order = ["knight", "prexzy"],
   onAttempt = null,
   fetchImpl = globalThis.fetch,
   apiTimeoutMs = 25000,
@@ -225,14 +231,18 @@ async function downloadViaApis({
 } = {}) {
   const list = Array.isArray(candidates) ? candidates : [];
   const apis = Array.isArray(order) ? order.filter((a) => a === "knight" || a === "prexzy") : [];
-  if (apis.length === 0) apis.push("prexzy", "knight");
+  if (apis.length === 0) apis.push("knight", "prexzy");
   const failures = [];
 
-  for (const api of apis) {
+  for (let i = 0; i < apis.length; i++) {
+    const api = apis[i];
+    const apiNo = i + 1;
     for (const cand of list) {
       const watchUrl = cand && cand.url;
       if (!watchUrl) continue;
-      if (onAttempt) onAttempt(`🌐 ${api === "knight" ? "Knight" : "Prexzy"} API: ${String(cand.title || cand.id || "").slice(0, 48)}`);
+      if (onAttempt) {
+        onAttempt(`🌐 API ${apiNo}: ${String(cand.title || cand.id || "").slice(0, 48)}`);
+      }
       try {
         let info;
         let dest;
@@ -247,6 +257,7 @@ async function downloadViaApis({
         return {
           path: dest,
           source: api,
+          apiNo,
           title: info.title || cand.title || "",
           thumbnail: info.thumbnail || "",
           author: info.uploader || "",

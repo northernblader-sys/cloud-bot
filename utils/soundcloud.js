@@ -313,7 +313,8 @@ async function downloadSoundCloudCandidates({
   for (const cand of list) {
     const link = cand && (cand.url || cand.pageUrl);
     if (!link) continue;
-    if (onAttempt) onAttempt(`SoundCloud: ${String(cand.title || link).slice(0, 48)}`);
+    // Generic label — the caller prefixes the chain position ("API 3").
+    if (onAttempt) onAttempt(String(cand.title || link).slice(0, 48));
     try {
       const got = await downloadSoundCloud(link, { fetchImpl, ffmpegPath });
       await fsp.writeFile(dest, got.buffer);

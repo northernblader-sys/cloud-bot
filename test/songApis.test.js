@@ -222,6 +222,7 @@ test("downloadViaApis retries the SAME API with the next candidate before switch
     });
     assert.ok(result, "second candidate succeeded");
     assert.equal(result.source, "knight");
+    assert.equal(result.apiNo, 1, "knight is API 1");
     assert.equal(result.path, path.join(dir, "Song.mp3"));
     assert.ok(fs.existsSync(result.path));
     assert.equal(knightUrls.length, 2, "same API, next video ID");
@@ -281,7 +282,8 @@ test("downloadViaApis falls to Prexzy only after every Knight candidate fails", 
     assert.equal(knightCalls, 2, "all Knight candidates first");
     assert.equal(prexzyCalls, 2, "then Prexzy candidates");
     assert.equal(labels.length, 4, "status edit per attempt");
-    assert.ok(labels[0].includes("Knight") && labels[2].includes("Prexzy"));
+    assert.ok(labels[0].includes("API 1") && labels[2].includes("API 2"));
+    assert.doesNotMatch(labels.join(" "), /knight|prexzy/i, "service names never reach the chat");
   } finally {
     if (prevEnv.k === undefined) delete process.env.KNIGHT_API_URL;
     else process.env.KNIGHT_API_URL = prevEnv.k;
@@ -337,7 +339,7 @@ test("downloadViaApis honors KNIGHT_API_URL / PREXZY_API_URL env overrides", asy
   }
 });
 
-test("default order is prexzy-first (user's chain), knight second", async () => {
+test("default order is knight-first (API 1), prexzy second (API 2)", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "songapis-test-"));
   const prevEnv = { k: process.env.KNIGHT_API_URL, p: process.env.PREXZY_API_URL };
   process.env.KNIGHT_API_URL = "https://knight.example";
@@ -345,28 +347,33 @@ test("default order is prexzy-first (user's chain), knight second", async () => 
   try {
     const order = [];
     const f = fakeFetch((url, opts) => {
-      if (url.includes("cdn.example")) return mediaResponse(url, opts);
-      if (url.includes("prexzy.example")) {
-        order.push("prexzy");
+      if (url.includes("cdn.example") || url.includes("googlevideo.com")) {
+        return mediaResponse(url, opts);
+      }
+      if (url.includes("knight.example")) {
+        order.push("knight");
         return { ok: false, status: 500, headers: new Map() };
       }
-      order.push("knight");
+      order.push("prexzy");
       return okJson({
-        success: true,
-        result: { title: "Song", id: "1", download: "https://cdn.example/a.mp3" },
+        status: true,
+        info: { id: "1", title: "Song" },
+        download_url: "https://rr5---sn-x.googlevideo.com/videoplayback?expire=1",
+        ext: "m4a",
       });
     });
-    // No `order` option — the default must try Prexzy first. Prexzy fails
-    // for candidate 1, Knight picks it up from there.
+    // No `order` option — the default must try Knight first. Knight fails
+    // for candidate 1, Prexzy picks it up from there.
     const result = await downloadViaApis({
       candidates: [{ id: "1", title: "A", url: "https://www.youtube.com/watch?v=1" }],
       outBase: path.join(dir, "Song"),
       fetchImpl: f,
     });
     assert.ok(result);
-    assert.equal(result.source, "knight");
-    assert.deepEqual(order, ["prexzy", "knight"], "prexzy tried before knight by default");
-    assert.equal(result.path, path.join(dir, "Song.mp3"));
+    assert.equal(result.source, "prexzy");
+    assert.equal(result.apiNo, 2, "prexzy is API 2 in the default chain");
+    assert.deepEqual(order, ["knight", "prexzy"], "knight tried before prexzy by default");
+    assert.equal(result.path, path.join(dir, "Song.m4a"));
     assert.ok(fs.existsSync(result.path));
   } finally {
     if (prevEnv.k === undefined) delete process.env.KNIGHT_API_URL;
