@@ -7,22 +7,21 @@
  * return a download URL for a file sitting on someone else's CDN, so a
  * flagged datacenter IP (Render) or dead proxy doesn't matter for them.
  *
- *   1. Knight  — GET {KNIGHT_API_URL}/api/download/ytaudio
+ *   1. Prexzy  — GET {PREXZY_API_URL}/download/ytmp3?url=<watch url>
+ *                -> { status, info: {...}, download_url }
+ *                `download_url` is a raw googlevideo.com link (.m4a) that
+ *                EXPIRES within hours — download it immediately and never
+ *                store the URL. Response body is ~10 KB; never log it whole.
+ *   2. Knight  — GET {KNIGHT_API_URL}/api/download/ytaudio
  *                ?format=128kbps&apikey=knight&url=<watch url>
  *                -> { success, result: { title, id, download } }
  *                `download` is an MP3 on savetube.vip's CDN: no IP lock,
  *                no expiry. apikey=knight is the free shared key from
  *                KnightBot's public repo — not a secret.
- *   2. Prexzy  — GET {PREXZY_API_URL}/download/ytmp3?url=<watch url>
- *                -> { status, info: {...}, download_url }
- *                `download_url` is a raw googlevideo.com link (.m4a) that
- *                EXPIRES within hours — download it immediately and never
- *                store the URL. Response body is ~10 KB; never log it whole.
  *
- * The caller (commands/music.js) implements the fallback order from the
- * method write-up:
- *     Knight (candidate 1) -> Knight (candidate 2) -> ... ->
- *     Prexzy (candidate 1) -> Prexzy (candidate 2) -> ... -> yt-dlp
+ * (The caller can reorder via downloadViaApis()'s `order` option; the
+ * current chain puts Prexzy first, then Knight, then SoundCloud.)
+ *
  * The same API is retried with the NEXT candidate video before switching
  * APIs — one dead upload is not a dead API (measured: the official Adele
  * upload failed on both while 5 of 6 other uploads worked instantly).
@@ -193,15 +192,17 @@ async function downloadTo(
 }
 
 /**
- * The API phase of the fallback chain: every candidate through Knight
- * first (same API, next video ID), then every candidate through Prexzy,
- * then give up (caller falls back to yt-dlp).
+ * The API phase of the fallback chain: every candidate through the FIRST
+ * API (same API, next video ID), then every candidate through the second,
+ * then give up (caller falls back further). `opts.order` picks which API
+ * goes first — default ["prexzy", "knight"] (Prexzy first, per the user).
  *
  * @param {object} opts
  * @param {Array<{id,title,url}>} opts.candidates  ranked search results
  * @param {string} opts.outBase        output path WITHOUT extension;
  *                                     writes `<outBase>.mp3` (Knight) or
  *                                     `<outBase>.m4a` (Prexzy)
+ * @param {Array<"prexzy"|"knight">} [opts.order] API priority
  * @param {Function} [opts.onAttempt]  called with a short label before
  *                                     each attempt (chat status edits)
  * @param {Function} [opts.fetchImpl]  injection point for tests
@@ -213,45 +214,40 @@ async function downloadTo(
 async function downloadViaApis({
   candidates,
   outBase,
+  order = ["prexzy", "knight"],
   onAttempt = null,
   fetchImpl = globalThis.fetch,
   apiTimeoutMs = 25000,
   downloadTimeoutMs = 120 * 1000,
 } = {}) {
   const list = Array.isArray(candidates) ? candidates : [];
+  const apis = Array.isArray(order) ? order.filter((a) => a === "knight" || a === "prexzy") : [];
+  if (apis.length === 0) apis.push("prexzy", "knight");
   const failures = [];
 
-  // Phase 1 — Knight, all candidates.
-  for (const cand of list) {
-    const watchUrl = cand && cand.url;
-    if (!watchUrl) continue;
-    if (onAttempt) onAttempt(`🌐 Knight API: ${String(cand.title || cand.id || "").slice(0, 48)}`);
-    try {
-      const info = await fetchKnight(watchUrl, { fetchImpl, timeoutMs: apiTimeoutMs });
-      const dest = `${outBase}.mp3`;
-      await downloadTo(info.download, dest, { fetchImpl, timeoutMs: downloadTimeoutMs });
-      return { path: dest, source: "knight", title: info.title || cand.title || "" };
-    } catch (err) {
-      failures.push(`knight#${cand.id}: ${String((err && err.message) || err).slice(0, 160)}`);
-      // Clean a half-written file so the next attempt starts fresh.
-      await fs.promises.unlink(`${outBase}.mp3`).catch(() => {});
-    }
-  }
-
-  // Phase 2 — Prexzy, all candidates. googlevideo links expire, so the
-  // file is downloaded immediately and the URL is never stored/logged.
-  for (const cand of list) {
-    const watchUrl = cand && cand.url;
-    if (!watchUrl) continue;
-    if (onAttempt) onAttempt(`🌐 Prexzy API: ${String(cand.title || cand.id || "").slice(0, 48)}`);
-    try {
-      const info = await fetchPrexzy(watchUrl, { fetchImpl, timeoutMs: apiTimeoutMs });
-      const dest = `${outBase}.${info.ext === "mp3" ? "mp3" : "m4a"}`;
-      await downloadTo(info.download, dest, { fetchImpl, timeoutMs: downloadTimeoutMs });
-      return { path: dest, source: "prexzy", title: info.title || cand.title || "" };
-    } catch (err) {
-      failures.push(`prexzy#${cand.id}: ${String((err && err.message) || err).slice(0, 160)}`);
-      await fs.promises.unlink(`${outBase}.m4a`).catch(() => {});
+  for (const api of apis) {
+    for (const cand of list) {
+      const watchUrl = cand && cand.url;
+      if (!watchUrl) continue;
+      if (onAttempt) onAttempt(`🌐 ${api === "knight" ? "Knight" : "Prexzy"} API: ${String(cand.title || cand.id || "").slice(0, 48)}`);
+      try {
+        let info;
+        let dest;
+        if (api === "knight") {
+          info = await fetchKnight(watchUrl, { fetchImpl, timeoutMs: apiTimeoutMs });
+          dest = `${outBase}.mp3`;
+        } else {
+          info = await fetchPrexzy(watchUrl, { fetchImpl, timeoutMs: apiTimeoutMs });
+          dest = `${outBase}.${info.ext === "mp3" ? "mp3" : "m4a"}`;
+        }
+        await downloadTo(info.download, dest, { fetchImpl, timeoutMs: downloadTimeoutMs });
+        return { path: dest, source: api, title: info.title || cand.title || "" };
+      } catch (err) {
+        failures.push(`${api}#${cand.id}: ${String((err && err.message) || err).slice(0, 160)}`);
+        // Clean a half-written file so the next attempt starts fresh.
+        await fs.promises.unlink(`${outBase}.mp3`).catch(() => {});
+        await fs.promises.unlink(`${outBase}.m4a`).catch(() => {});
+      }
     }
   }
 
