@@ -19,13 +19,9 @@ const {
   search,
   clearPartials,
   fetchCover,
-  fetchDeezerCover,
+  lookupCover,
   downloadTrack,
 } = require(path.join(__dirname, "..", "utils", "songfetch.js"));
-
-const { ytdlpBaseFlags, isBotCheckError } = require(
-  path.join(__dirname, "..", "utils", "ytdlp.js")
-);
 
 test("fold lowercases and strips diacritics", () => {
   assert.equal(fold("Kóncert LIVE"), "koncert live");
@@ -70,23 +66,28 @@ test("rank does not demote keywords already in the query", () => {
   assert.equal(activeTerms("Live and Let Die").length, 2); // karaoke + cover remain
 });
 
-test("parseArtistTitle splits on ' - ' like songfetch.py", () => {
+test("parseArtistTitle splits on ' - ' and strips artist prefix like songfetch.py", () => {
   assert.deepEqual(parseArtistTitle("Daft Punk - One More Time"), {
     artist: "Daft Punk",
     title: "One More Time",
   });
   assert.deepEqual(parseArtistTitle("One More Time"), { artist: "", title: "One More Time" });
+  // `--artist X "X Title"` should not search for "X X Title".
+  assert.deepEqual(parseArtistTitle("Adele Love in the Dark", "Adele"), {
+    artist: "Adele",
+    title: "Love in the Dark",
+  });
 });
 
-test("search parses id/title/duration lines and skips NA", async () => {
+test("search parses id/title lines and skips NA", async () => {
   const fakeRunner = async () =>
-    "abc123\tDaft Punk - One More Time\t321\n" +
-    "NA\tMissing\tNA\n" +
-    "def456\tOne More Time (Live)\t400\n";
+    "abc123\tDaft Punk - One More Time\n" +
+    "NA\tMissing\n" +
+    "def456\tOne More Time (Live)\n";
   const out = await search("Daft Punk One More Time", { ytdlpImpl: fakeRunner });
   assert.deepEqual(out, [
-    { id: "abc123", title: "Daft Punk - One More Time", url: "https://www.youtube.com/watch?v=abc123", duration: 321 },
-    { id: "def456", title: "One More Time (Live)", url: "https://www.youtube.com/watch?v=def456", duration: 400 },
+    { id: "abc123", title: "Daft Punk - One More Time", url: "https://www.youtube.com/watch?v=abc123" },
+    { id: "def456", title: "One More Time (Live)", url: "https://www.youtube.com/watch?v=def456" },
   ]);
 });
 
@@ -140,20 +141,36 @@ test("fetchCover downloads via injected fetch and fails soft", async () => {
   }
 });
 
-test("fetchDeezerCover returns cover_big and fails soft", async () => {
-  const deezerFetch = async () => ({
+test("lookupCover requires exact artist match (iTunes, no wrong karaoke art)", async () => {
+  // Deezer's top hit for "adele love in the dark" is a karaoke tribute.
+  // lookupCover must skip it and return the real "25" artwork instead.
+  const itunesFetch = async () => ({
     ok: true,
-    json: async () => ({ data: [{ album: { cover_big: "https://cdn.example/big.jpg" } }] }),
+    json: async () => ({
+      results: [
+        {
+          artistName: "Delayed Karma",
+          trackName: "Love in the Dark (Originally Performed by Adele)",
+          artworkUrl100: "https://example.com/karaoke100.jpg",
+        },
+        {
+          artistName: "Adele",
+          trackName: "Love in the Dark",
+          artworkUrl100: "https://example.com/25-100x100bb.jpg",
+        },
+      ],
+    }),
   });
   assert.equal(
-    await fetchDeezerCover("Daft Punk", "One More Time", deezerFetch),
-    "https://cdn.example/big.jpg"
+    await lookupCover("Adele", "Love in the Dark", itunesFetch),
+    "https://example.com/25-600x600bb.jpg"
   );
+
   const badFetch = async () => {
     throw new Error("network down");
   };
-  assert.equal(await fetchDeezerCover("Daft Punk", "One More Time", badFetch), "");
-  assert.equal(await fetchDeezerCover("", "", deezerFetch), "");
+  assert.equal(await lookupCover("Adele", "Love in the Dark", badFetch), "");
+  assert.equal(await lookupCover("", "", itunesFetch), "");
 });
 
 test("downloadTrack tries ranked candidates until a file appears", async () => {
@@ -195,7 +212,7 @@ test("downloadTrack tries ranked candidates until a file appears", async () => {
       searchImpl,
       ytdlpImpl,
       ffmpegImpl,
-      fetchImpl: async () => ({ ok: false }), // no Deezer cover in tests
+      fetchImpl: async () => ({ ok: false }),
     });
     assert.ok(result, "downloadTrack returns a path");
     assert.equal(attempts, 2, "tried both candidates");
@@ -264,41 +281,4 @@ test("downloadTrack falls back to one-shot ytsearch when search is empty", async
   } finally {
     await rm(outRoot, { recursive: true, force: true });
   }
-});
-
-test("ytdlpBaseFlags defaults to android player client and honors env overrides", () => {
-  const beforeExtractor = process.env.YT_DLP_EXTRACTOR_ARGS;
-  const beforeClient = process.env.YT_DLP_PLAYER_CLIENT;
-  const beforeCookies = process.env.YT_DLP_COOKIES;
-  try {
-    delete process.env.YT_DLP_EXTRACTOR_ARGS;
-    delete process.env.YT_DLP_PLAYER_CLIENT;
-    delete process.env.YT_DLP_COOKIES;
-    const flags = ytdlpBaseFlags();
-    assert.match(flags.extractorArgs, /player_client=android/);
-    assert.equal(flags.retries, 3);
-
-    process.env.YT_DLP_PLAYER_CLIENT = "ios";
-    assert.match(ytdlpBaseFlags().extractorArgs, /player_client=ios/);
-
-    process.env.YT_DLP_EXTRACTOR_ARGS = "youtube:player_client=web";
-    assert.equal(ytdlpBaseFlags().extractorArgs, "youtube:player_client=web");
-
-    process.env.YT_DLP_COOKIES = "/tmp/cookies.txt";
-    assert.equal(ytdlpBaseFlags().cookies, "/tmp/cookies.txt");
-  } finally {
-    if (beforeExtractor === undefined) delete process.env.YT_DLP_EXTRACTOR_ARGS;
-    else process.env.YT_DLP_EXTRACTOR_ARGS = beforeExtractor;
-    if (beforeClient === undefined) delete process.env.YT_DLP_PLAYER_CLIENT;
-    else process.env.YT_DLP_PLAYER_CLIENT = beforeClient;
-    if (beforeCookies === undefined) delete process.env.YT_DLP_COOKIES;
-    else process.env.YT_DLP_COOKIES = beforeCookies;
-  }
-});
-
-test("isBotCheckError detects the YouTube bot wall", () => {
-  assert.equal(isBotCheckError(new Error("Sign in to confirm you're not a bot")), true);
-  assert.equal(isBotCheckError(new Error("Use --cookies-from-browser or --cookies for the authentication")), true);
-  assert.equal(isBotCheckError(new Error("HTTP 429 too many requests")), false);
-  assert.equal(isBotCheckError(null), false);
 });
