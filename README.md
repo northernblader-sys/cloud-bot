@@ -109,7 +109,10 @@ The yt-dlp binary is fetched into `bin/` by `scripts/install-ytdlp.js`, which
 runs automatically on `npm install`. It's yt-dlp's official standalone build
 (the one that embeds its own interpreter), so there's no Python, no apt, no
 pip, no Dockerfile changes — plain `npm install` works on Render's default
-Node environment. (`youtube-dl-exec` was tried first and dropped: its installer
+Node environment. The binary is also re-checked at every bot start and
+re-downloaded once it's older than 24 hours (`YT_DLP_MAX_AGE_HOURS`) —
+YouTube breaks old extractors between releases, so a stale binary shows up
+as mystery bot checks. (`youtube-dl-exec` was tried first and dropped: its installer
 demands a system Python 3.11+, which Render doesn't ship, and its default
 download is a Python zipapp that would need that interpreter at runtime too.)
 ffmpeg comes from the `ffmpeg-static` npm package. Downloads are cached in
@@ -120,9 +123,44 @@ cache to survive redeploys).
 Notes:
 
 - `.play` with no query just prints usage.
-- The download path runs `yt-dlp` against YouTube directly, so if YouTube
-  starts showing a bot check to your server's IP, the error surfaces in the
-  chat ("Download failed...") rather than failing silently.
+
+### When YouTube says no (bot check / 429)
+
+yt-dlp never asks for cookies interactively — "use --cookies-from-browser
+or --cookies" is a static remedy suffix it glues onto failures
+(extractor/common.py). The line *before* it names the real cause:
+
+| What yt-dlp says | Real cause | Do cookies help? |
+| --- | --- | --- |
+| Sign in to confirm you're not a bot | IP reputation / too many requests (datacenter, VPN) | Rarely — it's the IP, not the login |
+| HTTP Error 429 | Rate limited | No — slow down |
+| Age-restricted video | Needs an account | Yes, but the bot doesn't use cookies |
+| Private video / Video unavailable | Deleted or private | No |
+
+The bot handles this the way music-seeker's `player.py` does — that repo
+hit the exact same wall and chose **not** to use cookies:
+
+- After a bot check or 429 it starts a **5-minute cooldown** (300 s, like
+  their `YT_COOLDOWN = 300.0`) and every `.play` fails fast with the
+  remaining time instead of hammering YouTube — more requests from a
+  flagged IP only extend the block. Bot checks/429s also stop the
+  candidate loop immediately instead of trying all 5 uploads.
+- Candidate attempts within one track are spaced **5 s apart**
+  ("50 requests in a row from one IP is what earns the bot check").
+- The yt-dlp binary is **refreshed when older than 24 h** — at every bot
+  start and on `npm install` (`YT_DLP_MAX_AGE_HOURS` to tune, `0` =
+  always refresh, `-1` = never). YouTube breaks old extractors between
+  releases, and a current binary alone clears a lot of "bot checks".
+- Failure messages name the real cause (bot check, 429, age-restricted,
+  private/removed) instead of a generic error.
+
+The biggest lever is outside the code: a datacenter IP (Render, a VPS)
+is what earns the bot check in the first place. A residential IP or a
+different host fixes it outright. Cookies were deliberately **not**
+built in — the source repo made the same call — because they bind
+downloads to a personal Google account (bulk automated downloading is a
+real ban risk), expire in weeks, and are a patch on an IP problem, not
+a fix.
 
 `.tiktok`/`.ig`/`.pinterest`/`.fb` use tikwm.com and api-faa.my.id. Those are third-party scraper APIs, not official platform APIs — they can change or go down without notice. If one stops working, the fix is updating the relevant fetch function in `utils/downloaders/fetchers.js`.
 

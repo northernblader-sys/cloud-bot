@@ -9,7 +9,7 @@ const http = require("node:http");
 const path = require("node:path");
 const os = require("node:os");
 const { existsSync, readFileSync, writeFileSync } = require("node:fs");
-const { mkdtemp, chmod, stat, rm } = require("node:fs/promises");
+const { mkdtemp, chmod, stat, utimes, rm } = require("node:fs/promises");
 
 const { ytdlp, toArgs, assetFor, binPath, installYtDlp } = require(
   path.join(__dirname, "..", "utils", "ytdlp.js")
@@ -142,6 +142,66 @@ test("installYtDlp rejects HTTP errors and too-small responses", async () => {
     );
     // Neither failure may leave a binary behind.
     assert.equal(existsSync(path.join(dir, "yt-dlp")), false);
+  } finally {
+    server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("installYtDlp refreshes a stale binary (24h max age)", async () => {
+  const { server, base } = await startServer();
+  const dir = await mkdtemp(path.join(os.tmpdir(), "ytdlp-test-"));
+  try {
+    const dest = path.join(dir, process.platform === "win32" ? "yt-dlp.exe" : "yt-dlp");
+    writeFileSync(dest, Buffer.alloc(2 * 1024 * 1024, 7));
+    // Age the binary past the refresh threshold (default: 24 h).
+    const old = new Date(Date.now() - 25 * 60 * 60 * 1000);
+    await utimes(dest, old, old);
+
+    const result = await installYtDlp({ dir, url: `${base}/good` });
+    assert.equal(result.skipped, false, "stale binary was re-downloaded");
+    assert.ok(Date.now() - (await stat(dest)).mtimeMs < 60000, "binary was rewritten");
+    assert.equal((await stat(dest)).size, 2 * 1024 * 1024);
+  } finally {
+    server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("installYtDlp always refreshes with maxAgeMs: 0, never with a negative", async () => {
+  const { server, base } = await startServer();
+  const dir = await mkdtemp(path.join(os.tmpdir(), "ytdlp-test-"));
+  try {
+    const dest = path.join(dir, process.platform === "win32" ? "yt-dlp.exe" : "yt-dlp");
+    writeFileSync(dest, Buffer.alloc(2 * 1024 * 1024, 7));
+
+    const always = await installYtDlp({ dir, url: `${base}/good`, maxAgeMs: 0 });
+    assert.equal(always.skipped, false, "maxAgeMs 0 = always refresh");
+
+    writeFileSync(dest, Buffer.alloc(2 * 1024 * 1024, 7));
+    const never = await installYtDlp({ dir, url: `${base}/good`, maxAgeMs: -1 });
+    assert.equal(never.skipped, true, "negative maxAgeMs = never refresh");
+  } finally {
+    server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("installYtDlp keeps a stale binary when the refresh download fails", async () => {
+  const { server, base } = await startServer();
+  const dir = await mkdtemp(path.join(os.tmpdir(), "ytdlp-test-"));
+  try {
+    const dest = path.join(dir, process.platform === "win32" ? "yt-dlp.exe" : "yt-dlp");
+    writeFileSync(dest, Buffer.alloc(2 * 1024 * 1024, 7));
+    const old = new Date(Date.now() - 25 * 60 * 60 * 1000);
+    await utimes(dest, old, old);
+
+    const result = await installYtDlp({ dir, url: `${base}/missing` });
+    assert.equal(result.skipped, true, "soft-keep, not a hard failure");
+    assert.match(result.reason, /refresh failed/);
+    // The old binary is still there and still valid-sized.
+    assert.equal((await stat(dest)).size, 2 * 1024 * 1024);
+    assert.ok(!existsSync(`${dest}.part`), "no temp file left behind");
   } finally {
     server.close();
     await rm(dir, { recursive: true, force: true });

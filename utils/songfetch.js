@@ -27,6 +27,18 @@
  *    to the same output path, so a killed attempt leaves a `.part`
  *    that the next candidate will happily *resume* — one file, two
  *    different videos' bytes.
+ * 4. **When YouTube says no, read the real cause.** "Use --cookies" is
+ *    a static remedy suffix yt-dlp appends to failures — never a prompt.
+ *    The line before it names the actual problem: "Sign in to confirm
+ *    you're not a bot" / HTTP 429 means the server's *IP* is flagged
+ *    (cookies rarely help; hammering retries extends the block),
+ *    age-restricted means an account is needed, private/unavailable
+ *    means the upload is gone. Following music-seeker's player.py
+ *    (which chose NOT to use cookies), a bot check or 429 starts a
+ *    300 s cooldown (`YT_COOLDOWN_MS`) during which every download
+ *    fails fast, candidate attempts are spaced 5 s apart, and the
+ *    yt-dlp binary is refreshed once it is older than 24 h (see
+ *    utils/ytdlp.js).
  *
  * Node adaptations (behaviour identical to songfetch.py):
  *   - yt-dlp binary is `bin/yt-dlp` (standalone, no Python) instead of
@@ -50,8 +62,14 @@ const { ytdlp } = require("./ytdlp");
 const YT_SEARCH_TIMEOUT_MS = 20 * 1000;
 const TRACK_DL_TIMEOUT_MS = 600 * 1000;
 const TAG_TIMEOUT_MS = 120 * 1000;
-
 const YT_WATCH = "https://www.youtube.com/watch?v=";
+
+// music-seeker's player.py mitigation for YouTube's IP wall:
+//   YT_COOLDOWN = 300.0  — after a bot check / 429, every download fails
+//                          fast for 5 minutes instead of hammering
+//                          YouTube (which only extends the block)
+//   requests spaced apart — "50 in a row from one IP is what earns the
+//                          bot check" (5 s between candidate attempts)
 
 // ── 1. choosing which YouTube result to use (from app/services/ytpick.py) ──
 // Word-boundary patterns matched against a folded title. Deliberately
@@ -119,6 +137,80 @@ function parseArtistTitle(query, artist = "") {
   return { artist: a, title: t };
 }
 
+// ── 1b. when YouTube says no (from music-seeker's app/services/player.py) ──
+// yt-dlp never asks for cookies interactively: "use --cookies" is a static
+// remedy suffix it glues onto failures (extractor/common.py:595). The line
+// before it names the real cause:
+//
+//   "Sign in to confirm you're not a bot"  -> IP reputation (datacenter/VPN)
+//   HTTP Error 429                          -> rate limited; slow down
+//   age-restricted / inappropriate           -> needs an account (cookies WOULD help)
+//   private video / video unavailable        -> gone; nothing helps
+//
+// player.py:31-40 measured that once YouTube flags the address, EVERY track
+// fails until it cools down. Their mitigation, mirrored here: a 300 s
+// cooldown after a bot check/429, requests spaced apart, and nightly yt-dlp
+// updates (see utils/ytdlp.js). No cookies — the same call the source repo
+// made: they bind downloads to a personal Google account (ban risk), expire
+// in weeks, and are a patch on an IP problem, not a fix.
+
+const YT_COOLDOWN_MS = 300 * 1000; // player.py: YT_COOLDOWN = 300.0
+const ATTEMPT_GAP_MS = 5 * 1000; // "space requests 5-10s apart"
+
+const FAILURE_PATTERNS = [
+  ["botcheck", /sign in to confirm|not a bot/i],
+  ["ratelimit", /http error 429|\b429\b|too many requests/i],
+  ["age", /\bage[- ]?restrict|\binappropriate\b/i],
+  [
+    "unavailable",
+    /private video|video unavailable|has been removed|content is not available|no longer available|does not exist/i,
+  ],
+  ["format", /requested format is not available/i],
+];
+
+/** Map a yt-dlp failure to its real cause (see the table above). */
+function classifyError(err) {
+  const msg = String((err && err.message) || err || "");
+  for (const [kind, re] of FAILURE_PATTERNS) {
+    if (re.test(msg)) return kind;
+  }
+  return "other";
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+let cooldownUntil = 0;
+let lastFailure = null; // { kind, detail, at } — the most recent attempt's cause
+
+/** Record a failure's cause; starts the 300 s cooldown on bot check / 429. */
+function noteFailure(err) {
+  const kind = classifyError(err);
+  const detail = String((err && err.message) || err || "")
+    .split("\n")
+    .find((line) => line.trim()) || "";
+  lastFailure = { kind, detail: detail.trim().slice(0, 200), at: Date.now() };
+  if (kind === "botcheck" || kind === "ratelimit") {
+    cooldownUntil = Date.now() + YT_COOLDOWN_MS;
+  }
+  return lastFailure;
+}
+
+/** Milliseconds left in the IP cooldown (0 = clear). */
+function cooldownRemainingMs() {
+  return Math.max(0, cooldownUntil - Date.now());
+}
+
+/** Forget the cooldown (admin escape hatch; also used by tests). */
+function clearCooldown() {
+  cooldownUntil = 0;
+  lastFailure = null;
+}
+
+/** The cause of the most recent failed attempt, or null. */
+function lastFailureInfo() {
+  return lastFailure;
+}
+
 /**
  * Top `limit` matches as [{id, title, url}] in relevance order.
  * Exactly as songfetch.py: `--flat-playlist --no-warnings
@@ -143,6 +235,7 @@ async function search(query, opts = {}) {
     );
   } catch (err) {
     if (/binary not found/i.test(String((err && err.message) || err))) throw err;
+    noteFailure(err); // a 429/bot check here starts the cooldown too
     return [];
   }
 
@@ -323,6 +416,7 @@ async function downloadTrack(opts = {}) {
     searchTimeoutMs = YT_SEARCH_TIMEOUT_MS,
     trackTimeoutMs = TRACK_DL_TIMEOUT_MS,
     tagTimeoutMs = TAG_TIMEOUT_MS,
+    attemptGapMs = ATTEMPT_GAP_MS,
     ytdlpImpl = ytdlp,
     searchImpl = search,
     fetchImpl = globalThis.fetch,
@@ -330,6 +424,10 @@ async function downloadTrack(opts = {}) {
   } = opts;
 
   if (!title) throw new Error("title is required");
+
+  // player.py rule: once YouTube flags the address, EVERY track fails
+  // until the IP cools down — so fail fast instead of re-flagging it.
+  if (cooldownRemainingMs() > 0) return null;
 
   const safeArtist = sanitize(artist) || "Unknown Artist";
   const safeAlbum = sanitize(album) || "Unknown Album";
@@ -360,30 +458,49 @@ async function downloadTrack(opts = {}) {
       flags.maxDownloads = 1;
     }
     clearPartials(outDir, safeTitle);
+    let blocked = false;
     try {
       await ytdlpImpl(target, flags, { timeoutMs });
-    } catch {
+    } catch (err) {
+      noteFailure(err);
+      const kind = classifyError(err);
+      // A bot check / 429 means the server's IP is flagged: further
+      // candidates only extend the block, so tell the caller to stop.
+      blocked = kind === "botcheck" || kind === "ratelimit";
       // Fall through: success is "does the file exist", not exit code.
     }
-    return fs.existsSync(finalFile);
+    if (fs.existsSync(finalFile)) return { ok: true, blocked: false };
+    return { ok: false, blocked };
   }
 
   // Phase 1: search, rank, try each candidate in turn.
   const deadline = Date.now() + trackTimeoutMs * 2;
   let ok = false;
+  let blocked = false;
   const candidates = await searchImpl(query, { limit: searchLimit, timeoutMs: searchTimeoutMs, ytdlpImpl });
+  let first = true;
   for (const cand of rank(candidates, query)) {
     const left = deadline - Date.now();
     if (left <= 1000) break;
+    if (!first && attemptGapMs > 0) await sleep(attemptGapMs);
+    first = false;
     if (progress) progress(`trying: ${String(cand.title || "").slice(0, 60)}`);
-    if (await attempt(cand.url, Math.min(trackTimeoutMs, left), false)) {
+    const res = await attempt(cand.url, Math.min(trackTimeoutMs, left), false);
+    if (res.ok) {
       ok = true;
       break;
     }
+    if (res.blocked) {
+      blocked = true;
+      break;
+    }
   }
-  if (!ok && (!candidates || candidates.length === 0)) {
+  if (!ok && !blocked && (!candidates || candidates.length === 0)) {
     // The search itself failed — let yt-dlp search and fetch in one go.
-    ok = await attempt(`ytsearch${searchLimit}:${query}`, trackTimeoutMs, true);
+    // But if the search failure was a bot check / 429 (it just started
+    // the cooldown), don't fallback-hammer: fail fast like player.py.
+    if (cooldownRemainingMs() > 0) return null;
+    ok = (await attempt(`ytsearch${searchLimit}:${query}`, trackTimeoutMs, true)).ok;
   }
   if (!ok) return null;
 
@@ -436,8 +553,15 @@ module.exports = {
   fetchCover,
   lookupCover,
   downloadTrack,
+  classifyError,
+  noteFailure,
+  cooldownRemainingMs,
+  clearCooldown,
+  lastFailureInfo,
   DEMOTE,
   YT_SEARCH_TIMEOUT_MS,
   TRACK_DL_TIMEOUT_MS,
   TAG_TIMEOUT_MS,
+  YT_COOLDOWN_MS,
+  ATTEMPT_GAP_MS,
 };

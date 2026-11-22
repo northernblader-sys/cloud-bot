@@ -19,6 +19,13 @@
  * The `.play` download method itself lives in `utils/songfetch.js`
  * (search-rank-retry, ported from songfetch.py). This module is just
  * the binary installer + process runner.
+ *
+ * The installer also *refreshes*: YouTube breaks old extractors between
+ * releases, and music-seeker's answer ("nightly yt-dlp updates at every
+ * container start") clears a lot of "bot checks" on its own. A binary
+ * older than `YT_DLP_MAX_AGE_HOURS` (default 24) is re-downloaded on
+ * the next `npm install` or bot start; if the refresh fails, the
+ * existing binary is kept — an outdated yt-dlp beats no yt-dlp.
  */
 
 const fs = require("fs");
@@ -32,6 +39,16 @@ const BIN_DIR = path.join(__dirname, "..", "bin");
 // it's an HTML/JSON error page or a truncated download.
 const MIN_BINARY_BYTES = 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
+// music-seeker refreshes yt-dlp nightly at every container start; YouTube
+// breaks old extractors between releases. Default: refresh after 24 h.
+const DEFAULT_MAX_AGE_HOURS = 24;
+
+/** Max age (ms) a fetched binary may have before it gets re-downloaded. */
+function maxAgeMsFromEnv() {
+  const hours = Number(process.env.YT_DLP_MAX_AGE_HOURS);
+  const value = Number.isFinite(hours) ? hours : DEFAULT_MAX_AGE_HOURS;
+  return value * 60 * 60 * 1000; // 0 = always refresh, negative = never
+}
 
 /** Where the yt-dlp binary lives. YT_DLP_PATH overrides for custom setups. */
 function binPath(platform = process.platform) {
@@ -79,8 +96,13 @@ async function makeExecutable(filePath, platform) {
 
 /**
  * Download the standalone yt-dlp binary into `dir` (default: bin/).
- * Idempotent: skips (and re-chmods) when a valid-sized binary is already
- * there, so repeated `npm install` runs are free. Throws on any failure —
+ * Idempotent: skips when a valid-sized, fresh-enough binary is already
+ * there, so repeated `npm install` runs are free. A binary older than
+ * `maxAgeMs` is re-downloaded (music-seeker refreshes yt-dlp nightly at
+ * every container start — YouTube breaks old extractors, and a current
+ * binary alone clears a lot of bot checks). When the refresh fails but
+ * a valid binary exists, the old one is kept: an outdated yt-dlp beats
+ * no yt-dlp. Throws only when there is no usable binary afterwards —
  * we want a loud build-time error, not a silent .play failure later.
  *
  * @param {object} [opts]
@@ -89,6 +111,9 @@ async function makeExecutable(filePath, platform) {
  * @param {string} [opts.platform] defaults to process.platform
  * @param {string} [opts.arch] defaults to process.arch
  * @param {number} [opts.minBytes] sanity floor (default 1 MB)
+ * @param {number} [opts.maxAgeMs] refresh threshold (default 24 h;
+ *   0 = always refresh, negative = never; falls back to
+ *   $YT_DLP_MAX_AGE_HOURS when omitted)
  * @param {Function} [opts.fetchImpl] fetch override for tests
  */
 async function installYtDlp({
@@ -97,6 +122,7 @@ async function installYtDlp({
   platform = process.platform,
   arch = process.arch,
   minBytes = MIN_BINARY_BYTES,
+  maxAgeMs,
   fetchImpl = globalThis.fetch,
 } = {}) {
   if (process.env.YT_DLP_PATH) {
@@ -105,36 +131,59 @@ async function installYtDlp({
   if (typeof fetchImpl !== "function") {
     throw new Error("global fetch is unavailable — Node 18+ is required to install yt-dlp");
   }
+  const maxAge = maxAgeMs === undefined ? maxAgeMsFromEnv() : maxAgeMs;
 
   const dest = path.join(dir, platform === "win32" ? "yt-dlp.exe" : "yt-dlp");
+  const downloadUrl = url || `${RELEASE_BASE}/${assetFor(platform, arch)}`;
+
+  const download = async () => {
+    const res = await fetchImpl(downloadUrl, { redirect: "follow" });
+    if (!res.ok) {
+      throw new Error(`yt-dlp download failed: HTTP ${res.status} ${downloadUrl}`);
+    }
+    const body = Buffer.from(await res.arrayBuffer());
+    if (body.length < minBytes) {
+      throw new Error(
+        `yt-dlp download looks corrupt: ${body.length} bytes (< ${minBytes}) from ${downloadUrl}`
+      );
+    }
+    // Write to a temp name, then rename, so an interrupted install never
+    // leaves a truncated binary that would pass the exists-check next time.
+    await fs.promises.mkdir(dir, { recursive: true });
+    const tmp = `${dest}.part`;
+    await fs.promises.writeFile(tmp, body);
+    await fs.promises.rename(tmp, dest);
+    await makeExecutable(dest, platform);
+    return { dest, skipped: false, bytes: body.length };
+  };
 
   if (await isSizedFile(dest, minBytes)) {
     await makeExecutable(dest, platform);
-    return { dest, skipped: true };
+    let ageMs = 0;
+    try {
+      ageMs = Date.now() - (await fs.promises.stat(dest)).mtimeMs;
+    } catch {
+      ageMs = 0;
+    }
+    const fresh = maxAge > 0 && ageMs < maxAge;
+    if (maxAge < 0 || fresh) {
+      // maxAge < 0 = refresh disabled; otherwise still inside the window.
+      return { dest, skipped: true };
+    }
+    // Stale (or YT_DLP_MAX_AGE_HOURS=0): refresh. On failure keep the old
+    // binary and say why — an outdated yt-dlp beats no yt-dlp.
+    try {
+      return await download();
+    } catch (err) {
+      return {
+        dest,
+        skipped: true,
+        reason: `kept existing binary (age ${Math.round(ageMs / 3600000)}h) — refresh failed: ${err.message}`,
+      };
+    }
   }
 
-  const downloadUrl = url || `${RELEASE_BASE}/${assetFor(platform, arch)}`;
-  const res = await fetchImpl(downloadUrl, { redirect: "follow" });
-  if (!res.ok) {
-    throw new Error(`yt-dlp download failed: HTTP ${res.status} ${downloadUrl}`);
-  }
-
-  const body = Buffer.from(await res.arrayBuffer());
-  if (body.length < minBytes) {
-    throw new Error(
-      `yt-dlp download looks corrupt: ${body.length} bytes (< ${minBytes}) from ${downloadUrl}`
-    );
-  }
-
-  // Write to a temp name, then rename, so an interrupted install never
-  // leaves a truncated binary that would pass the exists-check next time.
-  await fs.promises.mkdir(dir, { recursive: true });
-  const tmp = `${dest}.part`;
-  await fs.promises.writeFile(tmp, body);
-  await fs.promises.rename(tmp, dest);
-  await makeExecutable(dest, platform);
-
-  return { dest, skipped: false, bytes: body.length };
+  return download();
 }
 
 /**
@@ -224,4 +273,5 @@ module.exports = {
   BIN_DIR,
   RELEASE_BASE,
   MIN_BINARY_BYTES,
+  DEFAULT_MAX_AGE_HOURS,
 };

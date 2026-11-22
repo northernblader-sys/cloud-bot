@@ -56,6 +56,10 @@ const {
   parseArtistTitle,
   downloadTrack,
   lookupCover,
+  classifyError,
+  noteFailure,
+  cooldownRemainingMs,
+  lastFailureInfo,
 } = require("../utils/songfetch");
 
 // Where downloaded songs are cached so a repeat .play is instant.
@@ -67,6 +71,38 @@ fs.mkdirSync(VIDEO_DIR, { recursive: true });
 
 // Tell fluent-ffmpeg where the bundled ffmpeg binary lives.
 ffmpeg.setFfmpegPath(ffmpegPath);
+
+/**
+ * The honest failure message, per the diagnosis table in README ("When
+ * YouTube says no"): "use --cookies" is a static remedy suffix yt-dlp
+ * appends to failures, not a prompt — the real cause is the line before
+ * it. The bot never suggests cookies for an IP flag, because they rarely
+ * help there (it's the IP, not a login) and the source repo chose not to
+ * use them.
+ */
+function failureMessage(what) {
+  const info = lastFailureInfo();
+  const kind = info && info.kind;
+  if (kind === "botcheck" || kind === "ratelimit") {
+    const mins = Math.max(1, Math.ceil(cooldownRemainingMs() / 60000));
+    return (
+      `🚫 YouTube is rate-limiting this server's IP${kind === "ratelimit" ? " (HTTP 429)" : " (bot check)"}.\n` +
+      "It's the IP, not a login — cookies rarely help here, and retrying nonstop makes it worse.\n" +
+      `Cooling down for ~${mins} min; try *${what}* again after that.`
+    );
+  }
+  if (kind === "age") {
+    return (
+      `🔒 *${what}* is age-restricted — it needs a signed-in account, ` +
+      "which the bot deliberately doesn't use (ban risk, expiring cookies)."
+    );
+  }
+  if (kind === "unavailable") {
+    return `🗑️ The uploads of *${what}* on YouTube are private or removed — nothing can fetch them.`;
+  }
+  const detail = info && info.detail ? `\n_${info.detail.slice(0, 160)}_` : "";
+  return `❌ Couldn't download *${what}* — every candidate failed.${detail}`;
+}
 
 /** Show usage when no query is given. */
 function playUsage() {
@@ -181,6 +217,11 @@ async function play(sock, from, msg, argText) {
   const oggPath = path.join(albumDir, `${safeTitle}.ogg`);
 
   if (!fs.existsSync(mp3Path)) {
+    // player.py rule: while the IP cooldown is active, fail fast with the
+    // remaining time instead of re-flagging the address.
+    if (cooldownRemainingMs() > 0) {
+      return say(failureMessage(title));
+    }
     // Step 5 of the method: cover art from iTunes (no key), exact artist
     // match, "" rather than a wrong image.
     const imageUrl = await lookupCover(artist, title);
@@ -199,9 +240,7 @@ async function play(sock, from, msg, argText) {
     });
 
     if (!got || !fs.existsSync(mp3Path)) {
-      return say(
-        `❌ Couldn't download *${title}* — every candidate failed. Try again or reword the query.`
-      );
+      return say(failureMessage(title));
     }
   } else {
     await say(`♻️ Cached: *${title}*`);
@@ -236,6 +275,10 @@ async function playVideo(sock, from, query, say) {
   if (fs.existsSync(outFile)) {
     await say(`♻️ Cached: *${query}*`);
   } else {
+    // player.py rule: while the IP cooldown is active, fail fast.
+    if (cooldownRemainingMs() > 0) {
+      return say(failureMessage(query));
+    }
     // Steps 1-2: search cheap, once, and rank (songfetch step 1-2).
     let candidates = [];
     try {
@@ -250,6 +293,9 @@ async function playVideo(sock, from, query, say) {
 
     if (ranked.length > 0) {
       await say(`🎬 Found: *${ranked[0].title}* — trying in order...`);
+    } else if (cooldownRemainingMs() > 0) {
+      // The search itself hit the bot check / 429 — don't fallback-hammer.
+      return say(failureMessage(query));
     }
 
     // Step 3: try each candidate until the file exists.
@@ -269,6 +315,7 @@ async function playVideo(sock, from, query, say) {
         break;
       } catch (err) {
         console.error(`video attempt ${i + 1} failed:`, (err && err.message) || err);
+        noteFailure(err);
         if (fs.existsSync(outFile)) {
           try {
             fs.unlinkSync(outFile);
@@ -276,11 +323,15 @@ async function playVideo(sock, from, query, say) {
             // ignore
           }
         }
+        // A bot check / 429 means the IP is flagged: stop the loop, the
+        // cooldown will make the next .play fail fast with a clear message.
+        const kind = classifyError(err);
+        if (kind === "botcheck" || kind === "ratelimit") break;
       }
     }
 
     if (!fs.existsSync(outFile)) {
-      return say(`❌ Couldn't download *${query}* — every candidate failed.`);
+      return say(failureMessage(query));
     }
   }
 
