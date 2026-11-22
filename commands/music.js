@@ -84,17 +84,19 @@ ffmpeg.setFfmpegPath(ffmpegPath);
 function failureMessage(what) {
   const info = lastFailureInfo();
   const kind = info && info.kind;
-  if (kind === "botcheck" || kind === "ratelimit") {
+  if (kind === "botcheck" || kind === "ratelimit" || kind === "forbidden") {
+    const label =
+      kind === "ratelimit" ? " (HTTP 429)" : kind === "forbidden" ? " (HTTP 403)" : " (bot check)";
     if (rotatingProxiesActive()) {
       return (
-        `🚫 YouTube flagged one of the proxy IPs while fetching *${what}*.\n` +
+        `🚫 YouTube flagged one of the proxy IPs while fetching *${what}*${label}.\n` +
         "That IP is benched for 10 min and the next ones get tried automatically.\n" +
-        "If this keeps failing, refresh the proxy list (YT_DLP_PROXY_LIST)."
+        "If this keeps failing, refresh the proxy list (YT_DLP_PROXY_LIST) — free datacenter proxies are often already flagged."
       );
     }
     const mins = Math.max(1, Math.ceil(cooldownRemainingMs() / 60000));
     return (
-      `🚫 YouTube is rate-limiting this server's IP${kind === "ratelimit" ? " (HTTP 429)" : " (bot check)"}.\n` +
+      `🚫 YouTube is rate-limiting this server's IP${label}.\n` +
       "It's the IP, not a login — cookies rarely help here, and retrying nonstop makes it worse.\n" +
       "Tip: set YT_DLP_PROXY to route yt-dlp through a different IP (README: \"If the IP stays blocked\").\n" +
       `Cooling down for ~${mins} min; try *${what}* again after that.`

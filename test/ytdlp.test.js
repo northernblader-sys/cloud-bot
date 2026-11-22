@@ -716,3 +716,18 @@ test("ytdlp calls rotate through the pool (observed via fake binary)", async () 
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("a CDN 403 (flagged IP for media) benches the proxy too", () => {
+  const undo = withProxyEnv({ list: "http://u:p@a:1,http://u:p@b:2", benchMs: 10000 });
+  try {
+    const a = nextProxy();
+    assert.equal(
+      penalizeProxy(a, new Error("ERROR: [youtube] x: unable to download video data: HTTP Error 403: Forbidden")),
+      true,
+      "403 is an IP-reputation fault"
+    );
+    assert.ok(proxyBenchRemaining(a) > 0);
+  } finally {
+    undo();
+  }
+});
