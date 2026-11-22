@@ -86,24 +86,43 @@ commands, or answers it conversationally.
 | `.tulsi mp3 <url>` | Audio extracted via the Tulsi API, sent as an MP3 audio message |
 | `.tulsi mp4 <url>` | 720p MP4 video via the Tulsi API, sent as a video message |
 
-`.play` uses the search-rank-retry method from `songfetch.py` (ported to
-Node in `utils/songfetch.js`, following it exactly): it searches YouTube
-cheaply once with `yt-dlp --flat-playlist --no-warnings --print
-"%(id)s\t%(title)s" ytsearch5:<query>` (top 5 titles, no video downloaded
-yet), ranks them so live/karaoke/cover versions go to the back, then
-tries each candidate in order until a file actually appears on disk —
-leftover `.part` files are deleted between attempts so one song never
-becomes two videos stitched together. The audio is downloaded as MP3
-(`-x --audio-format mp3 --audio-quality 0 --no-embed-metadata
---no-playlist`), tagged with the real artist/title/album plus cover art
-in one stream-copy ffmpeg pass — the cover comes from the iTunes Search
-API (no key, exact-artist match, "" rather than a wrong karaoke image) —
-and finally re-muxed with `ffmpeg-static` into mono 48 kHz Opus in an OGG
-container — the exact format WhatsApp inline-plays as an audio message
-(anything else shows up as a tap-to-open document).
-`.play -v <song>` sends the video as a 480p MP4 instead, with the same
-retry logic. If the flat search itself fails, it falls back to a
-one-shot `ytsearch5:<query>` download with `-i --max-downloads 1`.
+`.play` uses a **four-stage fallback chain**. The search happens in the
+bot (both APIs take a watch URL, not a song name): songfetch's cheap flat
+search (`yt-dlp --flat-playlist ytsearch5:<query>`, top 5 titles, no video
+downloaded) + rank (live/karaoke/cover to the back). Then, in order:
+
+1. **Cache hit** → send immediately.
+2. **Knight API** (`utils/songApis.js`): one GET returns an MP3 already
+   sitting on a CDN (`result.download`) — no IP lock, no expiry. Tried
+   with every ranked candidate before switching APIs, because one dead
+   upload is not a dead API (measured: the official Adele upload failed
+   on both APIs while 5 of 6 other uploads worked instantly).
+3. **Prexzy API**: same idea, but the `download_url` is a raw
+   googlevideo.com `.m4a` that **expires within hours** — downloaded
+   immediately, the URL never stored. Quality is ~64 kbps in practice,
+   which is what WhatsApp gets anyway.
+4. **yt-dlp** (`utils/songfetch.js`, the songfetch.py search-rank-retry
+   method): the last resort, and the only stage the server's own IP /
+   proxy pool touches. The 300 s YouTube cooldown gates ONLY this stage —
+   the APIs run first even while the YouTube route cools down.
+
+Whichever stage won, the audio is converted with `ffmpeg-static` into
+mono 48 kHz Opus in an OGG container — the exact format WhatsApp
+inline-plays (anything else is a tap-to-open document). The metadata
+card (cover art + name/artist/album/duration, from iTunes) is sent
+before the download regardless of which stage serves the file.
+`.play -v <song>` still uses yt-dlp directly (video APIs weren't part of
+the switch), with the same retry logic.
+
+The API base URLs live in env vars so a dead endpoint can be swapped
+without a code deploy (10 endpoints tested in the wild: 3 deleted, 2
+without DNS):
+
+| Env var | Default | Purpose |
+| --- | --- | --- |
+| `KNIGHT_API_URL` | `https://knightbotapi.stream` | Knight base URL |
+| `KNIGHT_API_KEY` | `knight` | the free shared key from KnightBot's public repo — not a secret |
+| `PREXZY_API_URL` | `https://prexzyapis.com` | Prexzy base URL |
 
 The yt-dlp binary is fetched into `bin/` by `scripts/install-ytdlp.js`, which
 runs automatically on `npm install`. It's yt-dlp's official standalone build
