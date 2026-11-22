@@ -30,8 +30,10 @@
  * dead API. Pasted soundcloud.com / snd.sc links bypass the YouTube flow
  * entirely (resolve -> card from SC metadata -> download). The YouTube
  * flat search runs lazily — only when SoundCloud has failed. Whichever
- * stage wins, the file is converted to mono 48 kHz Opus/OGG — the format
- * WhatsApp inline-plays. The metadata card is sent before the download.
+ * stage wins, the file is sent DIRECTLY (mp3/m4a are natively playable
+ * WhatsApp audio formats — no transcode, no "Converting..." wait; the
+ * Opus/OGG path remains only as a send-failure fallback). The metadata
+ * card is sent before the download.
  *
  * Video mode (.play -v) still uses yt-dlp directly (songfetch search ->
  * rank -> try-each-candidate loop on MP4 downloads).
@@ -372,45 +374,53 @@ async function play(sock, from, msg, argText) {
     }
   }
 
-  // Convert + send (shared tail — see convertAndSendAudio).
+  // Send (shared tail — see sendAudioFile).
   const master = fs.existsSync(mp3Path) ? mp3Path : fs.existsSync(m4aPath) ? m4aPath : null;
   if (!master) {
     return say(failureMessage(title));
   }
-  await convertAndSendAudio(sock, from, albumDir, safeTitle, say);
+  await sendAudioFile(sock, from, master, safeTitle, say);
 }
 
 /**
- * Shared convert+send tail: finds the master (.mp3 or .m4a) in albumDir,
- * converts it to WhatsApp Opus/OGG when the cached .ogg is missing or
- * older than the master, and sends the audio message. The master may be
- * a yt-dlp MP3, a Knight MP3, or a SoundCloud/Prexzy .m4a — fluent-ffmpeg
- * reads the content, not the extension.
+ * Shared send tail: sends the master file DIRECTLY as a WhatsApp audio
+ * message. MP3 and M4A are natively playable audio formats in WhatsApp
+ * (same music bubble as when a phone sends an .m4a) — the mandatory Opus/
+ * OGG transcode only applies to voice-note mode (ptt: true), which we
+ * don't use. Skipping the conversion removes the whole "Converting for
+ * WhatsApp..." wait, and for SoundCloud HQ (AAC 160 kbps stereo) it is
+ * also a quality UPGRADE over the old 64 kbps mono Opus re-encode.
+ *
+ * The Opus/OGG path (mp3ToWhatsAppOgg) is kept only as a fallback for
+ * the rare case the direct send itself errors out.
  */
-async function convertAndSendAudio(sock, from, albumDir, safeTitle, say) {
-  const mp3Path = path.join(albumDir, `${safeTitle}.mp3`);
-  const m4aPath = path.join(albumDir, `${safeTitle}.m4a`);
-  const oggPath = path.join(albumDir, `${safeTitle}.ogg`);
+async function sendAudioFile(sock, from, masterPath, safeTitle, say) {
+  const ext = path.extname(masterPath).toLowerCase();
+  const mimetype = ext === ".m4a" ? "audio/mp4" : "audio/mpeg";
 
-  const master = fs.existsSync(mp3Path) ? mp3Path : fs.existsSync(m4aPath) ? m4aPath : null;
-  if (!master) throw new Error("no master audio file to convert");
+  // The audio upload can take several seconds — show it as Sending, not
+  // stuck on a conversion that already finished.
+  await say("✅ Sending...");
 
-  const staleOgg =
-    !fs.existsSync(oggPath) ||
-    fs.statSync(oggPath).mtimeMs < fs.statSync(master).mtimeMs;
-  if (staleOgg) {
-    await say("🎧 Converting for WhatsApp...");
-    await mp3ToWhatsAppOgg(master, oggPath);
+  try {
+    await sock.sendMessage(from, {
+      audio: fs.readFileSync(masterPath),
+      mimetype,
+      ptt: false, // false = music message; true = voice-note style
+      fileName: path.basename(masterPath),
+    });
+  } catch (sendErr) {
+    console.error("direct audio send failed, falling back to Opus/OGG:", (sendErr && sendErr.message) || sendErr);
+    const oggPath = masterPath.replace(/\.(mp3|m4a)$/i, ".ogg");
+    await say("🎧 Optimizing for WhatsApp...");
+    await mp3ToWhatsAppOgg(masterPath, oggPath);
+    await sock.sendMessage(from, {
+      audio: fs.readFileSync(oggPath),
+      mimetype: "audio/ogg; codecs=opus",
+      ptt: false,
+      fileName: `${safeTitle}.ogg`,
+    });
   }
-
-  // No "Sending..." status edit here — it cost a full round trip and the
-  // audio message itself is the signal.
-  await sock.sendMessage(from, {
-    audio: fs.readFileSync(oggPath),
-    mimetype: "audio/ogg; codecs=opus",
-    ptt: false, // false = music message; true = voice-note style
-    fileName: `${safeTitle}.ogg`,
-  });
 }
 
 /**
@@ -459,13 +469,13 @@ async function playSoundCloudLink(sock, from, query, scLink, say) {
     console.error("track card failed (continuing):", (cardErr && cardErr.message) || cardErr);
   }
 
-  const master = fs.existsSync(path.join(albumDir, `${safeTitle}.mp3`))
+  const existing = fs.existsSync(path.join(albumDir, `${safeTitle}.mp3`))
     ? path.join(albumDir, `${safeTitle}.mp3`)
     : fs.existsSync(path.join(albumDir, `${safeTitle}.m4a`))
       ? path.join(albumDir, `${safeTitle}.m4a`)
       : null;
 
-  if (master) {
+  if (existing) {
     await say(`♻️ Cached: *${track.title}*`);
   } else {
     const got = await downloadSoundCloudCandidates({
@@ -481,7 +491,15 @@ async function playSoundCloudLink(sock, from, query, scLink, say) {
     await say("✅ Downloaded from SoundCloud");
   }
 
-  await convertAndSendAudio(sock, from, albumDir, safeTitle, say);
+  const master = fs.existsSync(path.join(albumDir, `${safeTitle}.mp3`))
+    ? path.join(albumDir, `${safeTitle}.mp3`)
+    : fs.existsSync(path.join(albumDir, `${safeTitle}.m4a`))
+      ? path.join(albumDir, `${safeTitle}.m4a`)
+      : null;
+  if (!master) {
+    return say(failureMessage(track.title));
+  }
+  await sendAudioFile(sock, from, master, safeTitle, say);
 }
 
 /**
