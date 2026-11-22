@@ -306,22 +306,22 @@ async function fetchCover(imageUrl, destPath, fetchImpl = globalThis.fetch) {
 }
 
 /**
- * iTunes Search API cover lookup (no API key), with exact artist match.
- * Returns a 600x600 artwork URL or "" — never a wrong image. This is
- * the fix for the Deezer bug where the top hit was a karaoke tribute
- * ("Delayed Karma | Love in the Dark (Originally Performed by Adele)").
- * Caller passes the result as `imageUrl` to downloadTrack().
+ * iTunes Search API track lookup (no API key), with exact artist match.
+ * Returns the full metadata for the .play card, or null — never a wrong
+ * match. This is the fix for the Deezer bug where the top hit was a
+ * karaoke tribute ("Delayed Karma | Love in the Dark (Originally
+ * Performed by Adele)").
  */
-async function lookupCover(artist, title, fetchImpl = globalThis.fetch) {
-  if (typeof fetchImpl !== "function") return "";
+async function lookupTrackInfo(artist, title, fetchImpl = globalThis.fetch) {
+  if (typeof fetchImpl !== "function") return null;
   const q = [artist, title].filter(Boolean).join(" ").trim();
-  if (!q) return "";
+  if (!q) return null;
   try {
     const res = await fetchImpl(
       `https://itunes.apple.com/search?term=${encodeURIComponent(q)}&entity=song&limit=25`,
       { headers: { "User-Agent": "songfetch/1.0" } }
     );
-    if (!res.ok) return "";
+    if (!res.ok) return null;
     const data = await res.json();
     const rows = (data && data.results) || [];
     const wantArtist = fold(artist);
@@ -330,13 +330,28 @@ async function lookupCover(artist, title, fetchImpl = globalThis.fetch) {
       if (wantArtist && fold(row.artistName) !== wantArtist) continue;
       if (wantTitle && !fold(row.trackName).includes(wantTitle)) continue;
       const art = row.artworkUrl100 || "";
-      if (!art) continue;
-      return art.replace("100x100bb.jpg", "600x600bb.jpg");
+      return {
+        artworkUrl: art ? art.replace("100x100bb.jpg", "600x600bb.jpg") : "",
+        artistName: row.artistName || "",
+        trackName: row.trackName || "",
+        collectionName: row.collectionName || "",
+        durationMs: Number(row.trackTimeMillis) || 0,
+      };
     }
-    return "";
+    return null;
   } catch {
-    return "";
+    return null;
   }
+}
+
+/**
+ * Cover URL only — thin wrapper over lookupTrackInfo(). Returns a 600x600
+ * artwork URL or "" — never a wrong image. Caller passes the result as
+ * `imageUrl` to downloadTrack().
+ */
+async function lookupCover(artist, title, fetchImpl = globalThis.fetch) {
+  const info = await lookupTrackInfo(artist, title, fetchImpl);
+  return info ? info.artworkUrl : "";
 }
 
 function ffmpegBinary() {
@@ -552,6 +567,7 @@ module.exports = {
   clearPartials,
   fetchCover,
   lookupCover,
+  lookupTrackInfo,
   downloadTrack,
   classifyError,
   noteFailure,

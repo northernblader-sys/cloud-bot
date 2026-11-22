@@ -20,6 +20,7 @@ const {
   clearPartials,
   fetchCover,
   lookupCover,
+  lookupTrackInfo,
   downloadTrack,
   classifyError,
   cooldownRemainingMs,
@@ -208,6 +209,48 @@ test("lookupCover requires exact artist match (iTunes, no wrong karaoke art)", a
   };
   assert.equal(await lookupCover("Adele", "Love in the Dark", badFetch), "");
   assert.equal(await lookupCover("", "", itunesFetch), "");
+});
+
+test("lookupTrackInfo returns the full card metadata (names, album, duration)", async () => {
+  const itunesFetch = async () => ({
+    ok: true,
+    json: async () => ({
+      results: [
+        {
+          artistName: "Adele",
+          trackName: "Love in the Dark",
+          collectionName: "25",
+          trackTimeMillis: 285935,
+          artworkUrl100: "https://example.com/25-100x100bb.jpg",
+        },
+      ],
+    }),
+  });
+  const info = await lookupTrackInfo("Adele", "Love in the Dark", itunesFetch);
+  assert.ok(info);
+  assert.equal(info.artworkUrl, "https://example.com/25-600x600bb.jpg");
+  assert.equal(info.artistName, "Adele");
+  assert.equal(info.trackName, "Love in the Dark");
+  assert.equal(info.collectionName, "25");
+  assert.equal(info.durationMs, 285935);
+
+  // No confident match -> null (never wrong metadata on the card).
+  const noMatch = async () => ({
+    ok: true,
+    json: async () => ({ results: [{ artistName: "Someone Else", trackName: "Different Song" }] }),
+  });
+  assert.equal(await lookupTrackInfo("Adele", "Love in the Dark", noMatch), null);
+
+  // No artwork -> empty string URL, other fields intact.
+  const noArt = async () => ({
+    ok: true,
+    json: async () => ({
+      results: [{ artistName: "Adele", trackName: "Love in the Dark", trackTimeMillis: 285935 }],
+    }),
+  });
+  const bare = await lookupTrackInfo("Adele", "Love in the Dark", noArt);
+  assert.equal(bare.artworkUrl, "");
+  assert.equal(bare.durationMs, 285935);
 });
 
 test("downloadTrack tries ranked candidates until a file appears", async () => {

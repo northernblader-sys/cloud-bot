@@ -47,6 +47,7 @@ const fs = require("fs");
 const path = require("path");
 const ffmpeg = require("fluent-ffmpeg");
 const ffmpegPath = require("ffmpeg-static");
+const { buildTrackCard } = require("../utils/trackCard");
 const { ytdlp } = require("../utils/ytdlp");
 const {
   search,
@@ -55,7 +56,7 @@ const {
   sanitize,
   parseArtistTitle,
   downloadTrack,
-  lookupCover,
+  lookupTrackInfo,
   classifyError,
   noteFailure,
   cooldownRemainingMs,
@@ -217,17 +218,50 @@ async function play(sock, from, msg, argText) {
   const mp3Path = path.join(albumDir, `${safeTitle}.mp3`);
   const oggPath = path.join(albumDir, `${safeTitle}.ogg`);
 
+  const cardPath = path.join(albumDir, `${safeTitle}.card.png`);
+  let trackInfo = null;
+
   if (!fs.existsSync(mp3Path)) {
     // player.py rule: while the IP cooldown is active, fail fast with the
     // remaining time instead of re-flagging the address.
     if (cooldownRemainingMs() > 0) {
       return say(failureMessage(title));
     }
-    // Step 5 of the method: cover art from iTunes (no key), exact artist
-    // match, "" rather than a wrong image.
-    const imageUrl = await lookupCover(artist, title);
+    // One iTunes request feeds both the metadata card and the tag pass:
+    // cover art (exact artist match, "" rather than a wrong image),
+    // display names, album and duration.
+    trackInfo = await lookupTrackInfo(artist, title);
     await say(`📥 Downloading *${title}*...`);
+  }
 
+  // The metadata card: cover art with the real metadata drawn on it
+  // (name, artist, album • duration) — sent before the download starts
+  // and again on cached plays. Cached next to the audio so repeats skip
+  // the render; skipped silently when iTunes has no confident match
+  // (the ""-rule: never show wrong metadata).
+  try {
+    if (!fs.existsSync(cardPath)) {
+      if (!trackInfo) trackInfo = await lookupTrackInfo(artist, title);
+      let coverBuf = null;
+      if (trackInfo && trackInfo.artworkUrl) {
+        const res = await fetch(trackInfo.artworkUrl, { redirect: "follow" }).catch(() => null);
+        if (res && res.ok) coverBuf = Buffer.from(await res.arrayBuffer());
+      }
+      const png = await buildTrackCard({
+        title: (trackInfo && trackInfo.trackName) || title,
+        artist: (trackInfo && trackInfo.artistName) || artist,
+        album: trackInfo ? trackInfo.collectionName : "",
+        durationMs: trackInfo ? trackInfo.durationMs : 0,
+        cover: coverBuf,
+      });
+      fs.writeFileSync(cardPath, png);
+    }
+    await sock.sendMessage(from, { image: fs.readFileSync(cardPath) });
+  } catch (cardErr) {
+    console.error("track card failed (continuing):", (cardErr && cardErr.message) || cardErr);
+  }
+
+  if (!fs.existsSync(mp3Path)) {
     // Steps 1-4: search once, rank, try each candidate until the file
     // exists, clear .part files between attempts, tag it yourself.
     const got = await downloadTrack({
@@ -236,7 +270,7 @@ async function play(sock, from, msg, argText) {
       album: "",
       fmt: "mp3",
       outRoot: CACHE_ROOT,
-      imageUrl,
+      imageUrl: trackInfo ? trackInfo.artworkUrl : "",
       progress: (m) => say(`⏳ ${m}`),
     });
 
