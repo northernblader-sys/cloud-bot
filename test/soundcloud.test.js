@@ -278,7 +278,7 @@ test("downloadSoundCloudCandidates: next candidate on failure, file written to o
     assert.equal(result.path, path.join(dir, "Song.m4a"));
     assert.equal((await readFile(result.path)).length, M4A.length);
     assert.equal(labels.length, 2, "one status label per candidate");
-    assert.ok(labels[0].includes("SoundCloud"));
+    assert.ok(labels[0].includes("dead upload"), "label is the bare title (caller adds the API number)");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

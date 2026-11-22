@@ -86,32 +86,33 @@ commands, or answers it conversationally.
 | `.tulsi mp3 <url>` | Audio extracted via the Tulsi API, sent as an MP3 audio message |
 | `.tulsi mp4 <url>` | 720p MP4 video via the Tulsi API, sent as a video message |
 
-`.play` audio uses a **five-stage fallback chain**. The YouTube APIs go
-first (Prexzy, then Knight), SoundCloud is third — reached lazily with
-its own search only after both YouTube APIs failed — and yt-dlp is the
-last resort.
+`.play` audio uses a **five-stage fallback chain**. The chat never shows
+the API service names — stages appear only as **API 1**, **API 2**,
+**API 3** (the mapping below is for operators, not for the chat).
 
 1. **Cache hit** → send immediately.
-2. **Prexzy API** (`utils/songApis.js`): one GET per candidate returns a
+2. **API 1 = Knight** (`utils/songApis.js`): one GET per candidate
+   returns an MP3 already sitting on a CDN (`result.download`) — no IP
+   lock, no expiry. Every ranked candidate is tried before switching
+   APIs, because one dead upload is not a dead API (measured: the
+   official Adele upload failed on both APIs while 5 of 6 other uploads
+   worked instantly).
+3. **API 2 = Prexzy** (`utils/songApis.js`): one GET returns a
    `download_url` — a raw googlevideo.com `.m4a` that **expires within
-   hours** — downloaded immediately, the URL never stored. Every ranked
-   candidate is tried before switching APIs, because one dead upload is
-   not a dead API (measured: the official Adele upload failed on both
-   APIs while 5 of 6 other uploads worked instantly).
-3. **Knight API** (`utils/songApis.js`): one GET returns an MP3 already
-   sitting on a CDN (`result.download`) — no IP lock, no expiry.
-4. **SoundCloud** (`utils/soundcloud.js`, Prexzy's SC endpoints): its own
-   search (`/search/soundcloud`), rows ranked (sped up / slowed + reverb /
-   remix / cover to the back — but a keyword the user searched for is
-   never a penalty), then each candidate goes resolve → byte link
-   (`?id=<id>&mode=audio&quality=hq`; `lq` accepted when no HQ upload
-   exists) → ftyp+size sanity check. If the byte link fails, the signed
-   HLS playlist is remuxed with `ffmpeg -c copy -bsf:a aac_adtstoasc`.
-   No bot check, no proxy needed, ~4 s per track. Every URL here carries
-   an `expires=` stamp — only the file is ever stored. A pasted
-   SoundCloud link (`...soundcloud.com/...` or `snd.sc/...`,
-   share-tracking junk stripped) skips the chain entirely and uses the
-   track's own metadata for the card.
+   hours** — downloaded immediately, the URL never stored.
+4. **API 3 = SoundCloud** (`utils/soundcloud.js`, Prexzy's SC
+   endpoints): its own search (`/search/soundcloud`), rows ranked (sped
+   up / slowed + reverb / remix / cover to the back — but a keyword the
+   user searched for is never a penalty), then each candidate goes
+   resolve → byte link (`?id=<id>&mode=audio&quality=hq`; `lq` accepted
+   when no HQ upload exists) → ftyp+size sanity check. If the byte link
+   fails, the signed HLS playlist is remuxed with
+   `ffmpeg -c copy -bsf:a aac_adtstoasc`. No bot check, no proxy needed,
+   ~4 s per track. Every URL here carries an `expires=` stamp — only the
+   file is ever stored. A pasted SoundCloud link (`...soundcloud.com/...`
+   or `snd.sc/...`, share-tracking junk stripped) skips the chain
+   entirely and uses the track's own metadata for the card (the platform
+   name appears in chat only there, because the user pasted the link).
 5. **yt-dlp** (`utils/songfetch.js`, the songfetch.py search-rank-retry
    method): the last resort, and the only stage the server's own IP /
    proxy pool touches. The 300 s YouTube cooldown gates ONLY this stage —

@@ -13,19 +13,21 @@
  *     script (scripts/install-ytdlp.js); no Python, no system packages
  *   - ffmpeg-static / fluent-ffmpeg -> already in package.json
  *
- * How it works — audio mode runs a five-stage fallback chain:
+ * How it works — audio mode runs a five-stage fallback chain. Chat shows
+ * only generic labels ("API 1", "API 2", "API 3") — never the services:
  *
  *     cache hit?  ->  send
  *        | no
- *     Prexzy ytmp3 (candidate 1 -> 2 -> ...)  <- FIRST: YouTube -> .m4a
- *        | fail                                (googlevideo link — EXPIRES,
- *        |                                      download immediately, never store)
- *     Knight API (candidate 1 -> ...)          YouTube -> MP3 on savetube.vip
- *        | fail                                CDN (no IP lock, no expiry)
- *     SoundCloud (candidate 1 -> ...)          no bot check, no proxy needed;
- *        | fail                                reached lazily, own search
- *     yt-dlp (songfetch method)                last resort only; the 300s YouTube
- *                                              IP cooldown gates ONLY this stage
+ *     API 1 = Knight (candidate 1 -> 2 -> ...)   YouTube -> MP3 on
+ *        | fail                                   savetube.vip CDN (no IP
+ *        |                                        lock, no expiry)
+ *     API 2 = Prexzy (candidate 1 -> ...)        YouTube -> .m4a (googlevideo
+ *        | fail                                   link — EXPIRES, download
+ *        |                                        immediately, never store)
+ *     API 3 = SoundCloud (candidate 1 -> ...)    no bot check, no proxy
+ *        | fail                                   needed; reached lazily, own search
+ *     yt-dlp (songfetch method)                  last resort only; the 300s YouTube
+ *                                                IP cooldown gates ONLY this stage
  *
  * Same-API-next-candidate before switching APIs: one dead upload is not a
  * dead API. The YouTube flat search runs up front (both YouTube APIs take
@@ -251,8 +253,9 @@ async function play(sock, from, msg, argText) {
   if (wantVideo) return playVideo(sock, from, query, say);
 
   // ── Audio mode ──
-  // Chain order (per the user: Prexzy first, then Knight, then SoundCloud):
-  //   cache → Prexzy ytmp3 → Knight → SoundCloud (Prexzy SC endpoints) → yt-dlp.
+  // Chain order (per the user: Knight first, then Prexzy, then SoundCloud):
+  //   cache → Knight → Prexzy → SoundCloud (Prexzy SC endpoints) → yt-dlp.
+  // Chat labels are generic ("API 1/2/3") — never the service names.
   // The YouTube IP cooldown gates ONLY the yt-dlp stage.
 
   // A pasted SoundCloud link (soundcloud.com/... or snd.sc/...) bypasses
@@ -312,10 +315,11 @@ async function play(sock, from, msg, argText) {
 
     if (apiResult) {
       served = apiResult;
-      await say(`✅ Downloaded via ${apiResult.source} API`);
+      await say(`✅ Downloaded via API ${apiResult.apiNo}`);
     } else {
       // ── Stage 3: SoundCloud — its own search, reached lazily only after
-      // both YouTube APIs failed. No bot check, no proxy needed.
+      // both YouTube APIs failed. No bot check, no proxy needed. Chat
+      // label is generic ("API 3") like the others, per the user.
       try {
         const scRows = await searchSoundCloud(query, 8);
         const rankedSc = rankSoundCloud(scRows, query);
@@ -323,12 +327,12 @@ async function play(sock, from, msg, argText) {
           const scResult = await downloadSoundCloudCandidates({
             candidates: rankedSc,
             outBase,
-            onAttempt: (label) => say(`☁️ ${label}...`),
+            onAttempt: (label) => say(`☁️ API 3: ${label}...`),
           });
           if (scResult) {
             served = scResult;
             await say(
-              `✅ Downloaded from SoundCloud${scResult.author ? ` — ${scResult.author}` : ""}`
+              `✅ Downloaded via API 3${scResult.author ? ` — ${scResult.author}` : ""}`
             );
           }
         }
@@ -525,7 +529,9 @@ async function playSoundCloudLink(sock, from, query, scLink, say) {
     const got = await downloadSoundCloudCandidates({
       candidates: [{ id: track.id, title: track.title, url: scLink }],
       outBase: path.join(albumDir, safeTitle),
-      onAttempt: (label) => say(`☁️ ${label}...`),
+      // The user pasted a SoundCloud link themselves, so naming the
+      // platform here is fine — it's their own input, not a search stage.
+      onAttempt: (label) => say(`☁️ SoundCloud: ${label}...`),
     });
     if (!got) {
       return say(
