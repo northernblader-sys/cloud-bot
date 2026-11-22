@@ -139,10 +139,17 @@ function mp3ToWhatsAppOgg(inputPath, oggPath) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("audio conversion timed out")), 120 * 1000);
     ffmpeg(inputPath)
+      .noVideo() // ignore embedded cover streams — the card already showed them
       .audioCodec("libopus")
       .audioChannels(1)
       .audioFrequency(48000)
       .audioBitrate("64k")
+      // ffmpeg's libopus default is compression_level 10 — maximum CPU
+      // complexity, which on Render's small vCPU meant 30-90 s per song
+      // ("the conversion takes too long"). Level 3 is roughly 5-10x
+      // faster; at 64 kbps mono the audible difference is nil, and
+      // WhatsApp re-encodes audio itself for playback anyway.
+      .outputOptions(["-compression_level", "3", "-application", "audio"])
       .format("ogg")
       .on("error", (err) => {
         clearTimeout(timer);
@@ -341,7 +348,8 @@ async function play(sock, from, msg, argText) {
     await mp3ToWhatsAppOgg(master, oggPath);
   }
 
-  await say("✅ Sending...");
+  // No "Sending..." status edit here — it cost a full round trip and the
+  // audio message itself is the signal.
   await sock.sendMessage(from, {
     audio: fs.readFileSync(oggPath),
     mimetype: "audio/ogg; codecs=opus",
