@@ -322,6 +322,7 @@ async function downloadSoundCloudCandidates({
         source: "soundcloud",
         title: got.title || cand.title || "",
         author: got.author || "",
+        artwork: got.artwork || "",
         url: got.url || link,
       };
     } catch (err) {
