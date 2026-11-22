@@ -22,6 +22,7 @@ const mongo = require("./utils/mongo");
 const persist = require("./utils/persist");
 const { loadAuth } = require("./utils/authLoader");
 const { getCachedMetadata, invalidateGroupMetadata } = require("./utils/groupPermissions");
+const { installYtDlp } = require("./utils/ytdlp");
 
 // ── Health endpoint ────────────────────────────────────────────────
 // Lets hosts that need an open HTTP port (Render web service, etc.) run the
@@ -57,6 +58,23 @@ const BOT_NUMBER = (process.env.BOT_NUMBER || "2347073323366").replace(/\D/g, ""
 let currentSock = null; // only the newest socket is allowed to request pairing codes
 
 async function startBot() {
+  // Nightly yt-dlp refresh at container start (music-seeker's approach):
+  // YouTube breaks old extractors between releases, and the postinstall
+  // only runs at deploy time — with a persistent disk, bin/ would keep a
+  // stale binary. A fresh binary is a cheap local stat check; a stale one
+  // is re-downloaded; a failed refresh is logged and ignored (postinstall's
+  // copy still works, and .play reports a missing binary clearly).
+  try {
+    const r = await installYtDlp();
+    if (r.skipped) {
+      console.log(`[ytdlp] startup check: binary fresh${r.reason ? ` (${r.reason})` : ""}`);
+    } else {
+      console.log(`[ytdlp] startup check: refreshed (${((r.bytes || 0) / 1048576).toFixed(1)} MB)`);
+    }
+  } catch (err) {
+    console.error(`[ytdlp] startup refresh failed (continuing): ${err.message}`);
+  }
+
   // Session lives in MongoDB when MONGODB_URI is set (survives redeploys on
   // hosts with no disk), otherwise in the local auth_info/ folder. Stale or
   // half-finished sessions are cleared automatically.

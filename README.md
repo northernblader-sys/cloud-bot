@@ -86,18 +86,33 @@ commands, or answers it conversationally.
 | `.tulsi mp3 <url>` | Audio extracted via the Tulsi API, sent as an MP3 audio message |
 | `.tulsi mp4 <url>` | 720p MP4 video via the Tulsi API, sent as a video message |
 
-`.play` searches YouTube with the `yt-search` package (a plain search-results
-lookup, no login), downloads the audio with the standalone `yt-dlp` binary,
-and re-muxes it with `ffmpeg-static` into mono 48 kHz Opus
-in an OGG container — the exact format WhatsApp inline-plays as an audio
-message (anything else shows up as a tap-to-open document). `.play -v <song>`
-sends the video as a 480p MP4 instead.
+`.play` uses the search-rank-retry method from `songfetch.py` (ported to
+Node in `utils/songfetch.js`, following it exactly): it searches YouTube
+cheaply once with `yt-dlp --flat-playlist --no-warnings --print
+"%(id)s\t%(title)s" ytsearch5:<query>` (top 5 titles, no video downloaded
+yet), ranks them so live/karaoke/cover versions go to the back, then
+tries each candidate in order until a file actually appears on disk —
+leftover `.part` files are deleted between attempts so one song never
+becomes two videos stitched together. The audio is downloaded as MP3
+(`-x --audio-format mp3 --audio-quality 0 --no-embed-metadata
+--no-playlist`), tagged with the real artist/title/album plus cover art
+in one stream-copy ffmpeg pass — the cover comes from the iTunes Search
+API (no key, exact-artist match, "" rather than a wrong karaoke image) —
+and finally re-muxed with `ffmpeg-static` into mono 48 kHz Opus in an OGG
+container — the exact format WhatsApp inline-plays as an audio message
+(anything else shows up as a tap-to-open document).
+`.play -v <song>` sends the video as a 480p MP4 instead, with the same
+retry logic. If the flat search itself fails, it falls back to a
+one-shot `ytsearch5:<query>` download with `-i --max-downloads 1`.
 
 The yt-dlp binary is fetched into `bin/` by `scripts/install-ytdlp.js`, which
 runs automatically on `npm install`. It's yt-dlp's official standalone build
 (the one that embeds its own interpreter), so there's no Python, no apt, no
 pip, no Dockerfile changes — plain `npm install` works on Render's default
-Node environment. (`youtube-dl-exec` was tried first and dropped: its installer
+Node environment. The binary is also re-checked at every bot start and
+re-downloaded once it's older than 24 hours (`YT_DLP_MAX_AGE_HOURS`) —
+YouTube breaks old extractors between releases, so a stale binary shows up
+as mystery bot checks. (`youtube-dl-exec` was tried first and dropped: its installer
 demands a system Python 3.11+, which Render doesn't ship, and its default
 download is a Python zipapp that would need that interpreter at runtime too.)
 ffmpeg comes from the `ffmpeg-static` npm package. The optional `deno` npm
@@ -111,18 +126,115 @@ cache to survive redeploys).
 
 Notes:
 
-- Tracks over 10 minutes are rejected up front (a 3-hour mix would stall the
-  bot).
 - `.play` with no query just prints usage.
-- The download path runs `yt-dlp` against YouTube directly. YouTube shows
-  datacenter IPs (like Render's) a "Sign in to confirm you're not a bot"
-  check on its default clients; rather than using cookies, `.play` asks
-  yt-dlp for a ladder of client impersonations
-  (`android_vr,tv_downgraded,tv,web_embedded,mweb`) and, if the wall still
-  shows up, retries with `--force-ipv4` and a second client ladder. The
-  optional `deno` package gives those clients the JS runtime they need.
-  If every rung fails, the error (minus yt-dlp's cookie suggestion)
-  surfaces in the chat ("Download failed...") rather than failing silently.
+
+### When YouTube says no (bot check / 429)
+
+yt-dlp never asks for cookies interactively — "use --cookies-from-browser
+or --cookies" is a static remedy suffix it glues onto failures
+(extractor/common.py). The line *before* it names the real cause:
+
+| What yt-dlp says | Real cause | Do cookies help? |
+| --- | --- | --- |
+| Sign in to confirm you're not a bot | IP reputation / too many requests (datacenter, VPN) | Rarely — it's the IP, not the login |
+| HTTP Error 429 | Rate limited | No — slow down |
+| Age-restricted video | Needs an account | Yes, but the bot doesn't use cookies |
+| Private video / Video unavailable | Deleted or private | No |
+
+The bot handles this the way music-seeker's `player.py` does — that repo
+hit the exact same wall and chose **not** to use cookies:
+
+- After a bot check or 429 it starts a **5-minute cooldown** (300 s, like
+  their `YT_COOLDOWN = 300.0`) and every `.play` fails fast with the
+  remaining time instead of hammering YouTube — more requests from a
+  flagged IP only extend the block. Bot checks/429s also stop the
+  candidate loop immediately instead of trying all 5 uploads.
+- Candidate attempts within one track are spaced **5 s apart**
+  ("50 requests in a row from one IP is what earns the bot check").
+- The yt-dlp binary is **refreshed when older than 24 h** — at every bot
+  start and on `npm install` (`YT_DLP_MAX_AGE_HOURS` to tune, `0` =
+  always refresh, `-1` = never). YouTube breaks old extractors between
+  releases, and a current binary alone clears a lot of "bot checks".
+- Failure messages name the real cause (bot check, 429, age-restricted,
+  private/removed) instead of a generic error.
+- Every video download also rides a **client ladder** instead of
+  YouTube's default clients: `android_vr,tv_downgraded,tv,web_embedded,mweb`
+  via `--extractor-args`, with two escalation rungs (`--force-ipv4`, a
+  webpage-free fetch, then an alternate client mix) that only start when
+  yt-dlp's stderr actually shows the wall — no cookies anywhere. The
+  optional `deno` npm package (installed by the same plain
+  `npm install`) is passed via `--js-runtimes` so the JS-dependent
+  clients can decode their streams; `android_vr` — the rung that
+  bypasses the check — needs no runtime at all.
+
+The biggest lever is outside the code: a datacenter IP (Render, a VPS)
+is what earns the bot check in the first place. A residential IP or a
+different host fixes it outright. Cookies were deliberately **not**
+built in — the source repo made the same call — because they bind
+downloads to a personal Google account (bulk automated downloading is a
+real ban risk), expire in weeks, and are a patch on an IP problem, not
+a fix.
+
+### If the IP stays blocked: route yt-dlp through a different IP
+
+Set `YT_DLP_PROXY` and every yt-dlp call (search + download, audio +
+video) goes through it — **WhatsApp traffic stays direct**, so the bot
+session is untouched. yt-dlp accepts standard URLs:
+
+```bash
+YT_DLP_PROXY="socks5h://user:pass@proxy-host:1080"
+# or an HTTP proxy:
+YT_DLP_PROXY="http://user:pass@proxy-host:8080"
+```
+
+Use `socks5h://` (not `socks5://`) for SOCKS endpoints — the `h` makes
+DNS resolve *through the proxy*, which is the point when your local IP
+is the problem.
+
+What to point it at, roughly cheapest-first:
+
+| Endpoint | Cost | Trade-offs |
+| --- | --- | --- |
+| Cloudflare WARP in proxy mode (`warp-cli proxy`, local SOCKS5) | free | needs to run on the bot host, so Render must use the Docker runtime — it can't be installed on the default Node image; Cloudflare egress works for YouTube most of the time but is shared too |
+| Cheap VPS + a tiny SOCKS5 server (`3proxy`, `gost`, `microsocks`) | ~$4–5/mo | a fresh datacenter IP that usually isn't flagged; can get flagged again if volume gets abusive — then move it |
+| Residential proxy service (IPRoyal, Smartproxy, Soax, …) | ~$1.5–4/GB | the most reliable against the bot check; audio traffic is small — a 4-minute song at best quality is ~8 MB, so 1,000 songs ≈ 8 GB; use a **sticky session** so one download doesn't change IP mid-flight |
+| Home machine as exit node (Tailscale/WireGuard) | free | egress = your home (residential) IP; needs the VPN client on the bot host, so again Docker runtime on Render — or just run the bot at home |
+
+Notes:
+
+- The 300 s cooldown still applies while a proxy is set — it protects
+  the proxy's IP from the same hammering.
+- Only yt-dlp traffic is proxied. `npm install`, Baileys, and every
+  other fetch go out the normal route.
+- Pick a proxy whose other users don't hammer YouTube — a shared VPN
+  exit with abuse history is the same problem you're escaping.
+
+#### Rotating through several proxies
+
+`YT_DLP_PROXY_LIST` takes several proxy URLs (comma, semicolon, or
+newline separated — Webshare-style `http://user:pass@host:port`):
+
+```bash
+YT_DLP_PROXY_LIST="http://user:pass@1.2.3.4:6014,http://user:pass@5.6.7.8:6641,..."
+```
+
+- **Every yt-dlp call rotates to the next IP** (round-robin): the flat
+  search and each candidate download ride different addresses, which
+  spreads the request rate the way "space requests apart" wants.
+- A proxy that fails — dead endpoint, auth error, hang, or an IP YouTube
+  flags with a bot check/429 — is **benched for 10 minutes**
+  (`YT_DLP_PROXY_BENCH_MS` to change) and the rest keep working. Content
+  failures ("private video") don't bench anything; that's not the
+  proxy's fault.
+- While rotation is active (2+ proxies), the 300 s global cooldown is
+  **not** applied — one flagged IP shouldn't stall the other nine, and
+  each call is already on a different address. With a single proxy or a
+  direct connection, the cooldown applies exactly as before.
+- Only yt-dlp traffic rotates. Baileys/WhatsApp always stays direct.
+
+For Webshare's dashboard: Authentication = Username/Password, Connection
+= Direct Connection, then build `http://<username>:<password>@<address>:<port>`
+for each row.
 
 `.tiktok`/`.ig`/`.pinterest`/`.fb` use tikwm.com and api-faa.my.id. Those are third-party scraper APIs, not official platform APIs — they can change or go down without notice. If one stops working, the fix is updating the relevant fetch function in `utils/downloaders/fetchers.js`.
 

@@ -5,40 +5,115 @@
  * Commands:
  *   .play <song name>        Search YouTube and send the audio as a
  *                            WhatsApp audio message (plays inline).
- *   .play -v <song name>    Same, but sends the video instead of audio.
+ *   .play -v <song name>     Same, but sends the video instead of audio.
  *   .play                    Show usage help.
  *
  * Dependencies (all npm — zero system packages needed, works on Render):
  *   - yt-dlp standalone binary -> fetched into bin/ by the root postinstall
  *     script (scripts/install-ytdlp.js); no Python, no system packages
- *   - ffmpeg-static      ->  already in your package.json (bundles ffmpeg)
- *   - yt-search          ->  already in your package.json
- *   - fluent-ffmpeg      ->  already in your package.json
+ *   - ffmpeg-static / fluent-ffmpeg -> already in package.json
  *
- * Drop this file into commands/, wire it into handlers/router.js, restart
- * the bot. That's it.
+ * How it works — the songfetch.py method, followed exactly (ported in
+ * utils/songfetch.js, which this file only drives):
+ *
+ *   Audio mode calls downloadTrack() from utils/songfetch.js, which does
+ *   the whole method:
+ *     1. Search cheap, once. `yt-dlp --flat-playlist --no-warnings
+ *        --print "%(id)s\t%(title)s" ytsearch5:<query>` returns the top
+ *        5 titles as text in ~1s, no video downloaded.
+ *     2. Rank them. Titles containing live/karaoke/cover are pushed to
+ *        the back (never deleted), so the studio version is tried first.
+ *     3. Try each one until a file appears. Success is "does the file
+ *        exist", not exit code. Leftover .part files are deleted before
+ *        each retry, otherwise attempt #2 would resume attempt #1's
+ *        half-file and you'd get one song made of two different videos.
+ *     4. Tag it yourself: one stream-copy ffmpeg pass writes real
+ *        artist/title/album metadata plus the cover art (no re-encode).
+ *     5. Cover art comes from the iTunes Search API (no key) with an
+ *        exact-artist match — never from YouTube, and "" rather than a
+ *        wrong karaoke-tribute image.
+ *   The tagged MP3 is then re-muxed into mono 48 kHz Opus in an OGG
+ *   container — the exact format WhatsApp inline-plays as an audio
+ *   message (anything else shows up as a tap-to-open document).
+ *
+ *   Video mode (.play -v) applies the same search → rank → try-each-
+ *   candidate loop to MP4 downloads; there is no tagging step for video.
+ *
+ * No player-client overrides, no cookies, no retries/extractor-args
+ * tricks anywhere — the download flags are exactly songfetch.py's.
  */
 
 const fs = require("fs");
 const path = require("path");
-const yts = require("yt-search");
 const ffmpeg = require("fluent-ffmpeg");
 const ffmpegPath = require("ffmpeg-static");
-const { ytdlp } = require("../utils/ytdlp");
+const { buildTrackCard } = require("../utils/trackCard");
+const { ytdlp, rotatingProxiesActive } = require("../utils/ytdlp");
+const {
+  search,
+  rank,
+  clearPartials,
+  sanitize,
+  parseArtistTitle,
+  downloadTrack,
+  lookupTrackInfo,
+  classifyError,
+  noteFailure,
+  cooldownRemainingMs,
+  lastFailureInfo,
+} = require("../utils/songfetch");
 
-// Where to cache downloaded songs so a repeat .play is instant.
-const CACHE_DIR = path.join(__dirname, "..", "cache", "music");
-fs.mkdirSync(CACHE_DIR, { recursive: true });
-
-// Hard cap so a user can't request a 3-hour mix and hang the bot.
-const MAX_DURATION_SECONDS = 10 * 60; // 10 minutes
+// Where downloaded songs are cached so a repeat .play is instant.
+// Layout matches songfetch.py: <root>/<Artist>/<Album>/<Title>.<ext>
+const CACHE_ROOT = path.join(__dirname, "..", "cache", "music");
+const VIDEO_DIR = path.join(CACHE_ROOT, "video");
+fs.mkdirSync(CACHE_ROOT, { recursive: true });
+fs.mkdirSync(VIDEO_DIR, { recursive: true });
 
 // Tell fluent-ffmpeg where the bundled ffmpeg binary lives.
 ffmpeg.setFfmpegPath(ffmpegPath);
 
 /**
- * Show usage when no query is given.
+ * The honest failure message, per the diagnosis table in README ("When
+ * YouTube says no"): "use --cookies" is a static remedy suffix yt-dlp
+ * appends to failures, not a prompt — the real cause is the line before
+ * it. The bot never suggests cookies for an IP flag, because they rarely
+ * help there (it's the IP, not a login) and the source repo chose not to
+ * use them.
  */
+function failureMessage(what) {
+  const info = lastFailureInfo();
+  const kind = info && info.kind;
+  if (kind === "botcheck" || kind === "ratelimit") {
+    if (rotatingProxiesActive()) {
+      return (
+        `🚫 YouTube flagged one of the proxy IPs while fetching *${what}*.\n` +
+        "That IP is benched for 10 min and the next ones get tried automatically.\n" +
+        "If this keeps failing, refresh the proxy list (YT_DLP_PROXY_LIST)."
+      );
+    }
+    const mins = Math.max(1, Math.ceil(cooldownRemainingMs() / 60000));
+    return (
+      `🚫 YouTube is rate-limiting this server's IP${kind === "ratelimit" ? " (HTTP 429)" : " (bot check)"}.\n` +
+      "It's the IP, not a login — cookies rarely help here, and retrying nonstop makes it worse.\n" +
+      "Tip: set YT_DLP_PROXY to route yt-dlp through a different IP (README: \"If the IP stays blocked\").\n" +
+      `Cooling down for ~${mins} min; try *${what}* again after that.`
+    );
+  }
+  if (kind === "age") {
+    return (
+      `🔒 *${what}* is age-restricted — it needs a signed-in account, ` +
+      "which the bot deliberately doesn't use (ban risk, expiring cookies)."
+    );
+  }
+  if (kind === "unavailable") {
+    return `🗑️ The uploads of *${what}* on YouTube are private or removed — nothing can fetch them.`;
+  }
+  const detail = info && info.detail ? `\n_${info.detail.slice(0, 160)}_` : "";
+  return `❌ Couldn't download *${what}* — every candidate failed.${detail}`;
+}
+
+/** Show usage when no query is given. */
 function playUsage() {
   return (
     "🎵 *Music Player*\n\n" +
@@ -47,19 +122,73 @@ function playUsage() {
     "`.play -v <song name>` — send as video\n\n" +
     "Examples:\n" +
     "`.play love in the dark`\n" +
-    "`.play adele hello`\n" +
+    "`.play daft punk - one more time`\n" +
     "`.play -v coldplay yellow`\n\n" +
-    "_Tip: songs are cached, so the second `.play` of the same name is instant._"
+    "_Tip: songs are cached, so the second `.play` of the same song is instant._"
   );
 }
 
+/** Convert the tagged MP3 to WhatsApp's inline-play format: mono 48 kHz Opus in OGG. */
+function mp3ToWhatsAppOgg(mp3Path, oggPath) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("audio conversion timed out")), 120 * 1000);
+    ffmpeg(mp3Path)
+      .audioCodec("libopus")
+      .audioChannels(1)
+      .audioFrequency(48000)
+      .audioBitrate("64k")
+      .format("ogg")
+      .on("error", (err) => {
+        clearTimeout(timer);
+        reject(err);
+      })
+      .on("end", () => {
+        clearTimeout(timer);
+        resolve(oggPath);
+      })
+      .save(oggPath);
+  });
+}
+
 /**
- * Main entry. Called from handlers/router.js with the Baileys socket so
- * we can stream progress messages and send the audio file directly.
+ * Download one YouTube URL as an MP4 video (H.264 + AAC), 480p max.
+ * Success is "does the file exist", not exit code (songfetch rule).
+ */
+async function downloadVideo(url, outFile, skipUnavailable = false) {
+  const flags = {
+    // The bot-check client ladder may only offer pre-merged mp4 above
+    // 480p, so fall back to DASH (video+audio merged by ffmpeg-static)
+    // before giving up on the height cap.
+    format: "best[height<=480][ext=mp4]/bv[height<=480]+ba/b[height<=480]/best",
+    mergeOutputFormat: "mp4",
+    noPlaylist: true,
+    output: outFile,
+    ffmpegLocation: ffmpegPath,
+  };
+  if (skipUnavailable) {
+    // `-i` skips entries it cannot extract and `--max-downloads 1`
+    // stops at the first that works — that exits 101 ("max downloads
+    // reached"), so the exit code cannot be the success test. The file is.
+    flags.ignoreErrors = true;
+    flags.maxDownloads = 1;
+  }
+  let ytdlpError = null;
+  try {
+    await ytdlp(url, flags);
+  } catch (err) {
+    ytdlpError = err;
+  }
+  if (!fs.existsSync(outFile)) {
+    throw ytdlpError || new Error("yt-dlp produced no video file");
+  }
+}
+
+/**
+ * Main entry. Called from handlers/router.js with the Baileys socket.
  *
- * @param {object} sock   Baileys socket
- * @param {string} from   remoteJid (chat id)
- * @param {object} msg    original Baileys message (for replies/reactions)
+ * @param {object} sock    Baileys socket
+ * @param {string} from    remoteJid (chat id)
+ * @param {object} msg     original Baileys message (for replies)
  * @param {string} argText everything after the command
  */
 async function play(sock, from, msg, argText) {
@@ -80,151 +209,185 @@ async function play(sock, from, msg, argText) {
   const status = await sock.sendMessage(from, {
     text: `🔎 Searching YouTube for "${query}"...`,
   });
+  const say = (text) =>
+    sock.sendMessage(from, { text, edit: status.key }).catch(() => {});
 
-  // 1. Search YouTube
-  let video;
+  if (wantVideo) return playVideo(sock, from, query, say);
+
+  // ── Audio mode: the songfetch.py method via utils/songfetch.js ──
+
+  // songfetch.py's CLI split: "Artist - Title" or `--artist X "X Title"`.
+  const { artist, title } = parseArtistTitle(query);
+
+  // Cache path, same layout downloadTrack() writes:
+  // <root>/<Artist>/<Album>/<Title>.mp3 (+ .ogg for the WhatsApp copy)
+  const safeArtist = sanitize(artist) || "Unknown Artist";
+  const safeAlbum = sanitize("") || "Unknown Album";
+  const safeTitle = sanitize(title) || "Unknown";
+  const albumDir = path.join(CACHE_ROOT, safeArtist, safeAlbum);
+  const mp3Path = path.join(albumDir, `${safeTitle}.mp3`);
+  const oggPath = path.join(albumDir, `${safeTitle}.ogg`);
+
+  const cardPath = path.join(albumDir, `${safeTitle}.card.png`);
+  let trackInfo = null;
+
+  if (!fs.existsSync(mp3Path)) {
+    // player.py rule: while the IP cooldown is active, fail fast with the
+    // remaining time instead of re-flagging the address.
+    if (cooldownRemainingMs() > 0) {
+      return say(failureMessage(title));
+    }
+    // One iTunes request feeds both the metadata card and the tag pass:
+    // cover art (exact artist match, "" rather than a wrong image),
+    // display names, album and duration.
+    trackInfo = await lookupTrackInfo(artist, title);
+    await say(`📥 Downloading *${title}*...`);
+  }
+
+  // The metadata card: cover art with the real metadata drawn on it
+  // (name, artist, album • duration) — sent before the download starts
+  // and again on cached plays. Cached next to the audio so repeats skip
+  // the render; skipped silently when iTunes has no confident match
+  // (the ""-rule: never show wrong metadata).
   try {
-    const result = await yts(query);
-    video = result.videos[0];
-  } catch (err) {
-    console.error("yt-search error:", err);
-    return sock.sendMessage(from, {
-      text: "⚠️ Search failed. Try again in a moment.",
-      edit: status.key,
-    });
+    if (!fs.existsSync(cardPath)) {
+      if (!trackInfo) trackInfo = await lookupTrackInfo(artist, title);
+      let coverBuf = null;
+      if (trackInfo && trackInfo.artworkUrl) {
+        const res = await fetch(trackInfo.artworkUrl, { redirect: "follow" }).catch(() => null);
+        if (res && res.ok) coverBuf = Buffer.from(await res.arrayBuffer());
+      }
+      const png = await buildTrackCard({
+        title: (trackInfo && trackInfo.trackName) || title,
+        artist: (trackInfo && trackInfo.artistName) || artist,
+        album: trackInfo ? trackInfo.collectionName : "",
+        durationMs: trackInfo ? trackInfo.durationMs : 0,
+        cover: coverBuf,
+      });
+      fs.writeFileSync(cardPath, png);
+    }
+    await sock.sendMessage(from, { image: fs.readFileSync(cardPath) });
+  } catch (cardErr) {
+    console.error("track card failed (continuing):", (cardErr && cardErr.message) || cardErr);
   }
 
-  if (!video) {
-    return sock.sendMessage(from, {
-      text: `❌ No results for "${query}".`,
-      edit: status.key,
+  if (!fs.existsSync(mp3Path)) {
+    // Steps 1-4: search once, rank, try each candidate until the file
+    // exists, clear .part files between attempts, tag it yourself.
+    const got = await downloadTrack({
+      artist,
+      title,
+      album: "",
+      fmt: "mp3",
+      outRoot: CACHE_ROOT,
+      imageUrl: trackInfo ? trackInfo.artworkUrl : "",
+      progress: (m) => say(`⏳ ${m}`),
     });
+
+    if (!got || !fs.existsSync(mp3Path)) {
+      return say(failureMessage(title));
+    }
+  } else {
+    await say(`♻️ Cached: *${title}*`);
   }
 
-  // Reject overly long videos up front.
-  if (video.duration && video.duration.seconds > MAX_DURATION_SECONDS) {
-    return sock.sendMessage(from, {
-      text:
-        `⚠️ "${video.title}" is ${Math.round(video.duration.seconds / 60)} min long.\n` +
-        `Max is ${MAX_DURATION_SECONDS / 60} min. Try a shorter clip.`,
-      edit: status.key,
-    });
+  // WhatsApp inline-play format (Opus in OGG), cached next to the MP3.
+  if (!fs.existsSync(oggPath)) {
+    await say("🎧 Converting for WhatsApp...");
+    await mp3ToWhatsAppOgg(mp3Path, oggPath);
   }
 
+  await say("✅ Sending...");
   await sock.sendMessage(from, {
-    text:
-      `🎬 Found: *${video.title}*\n` +
-      `⏱️ ${video.timestamp || video.durationString || "?"} • 👁 ${video.views || "?"} views\n` +
-      `${wantVideo ? "📥 Downloading video..." : "📥 Downloading audio..."}`,
-    edit: status.key,
+    audio: fs.readFileSync(oggPath),
+    mimetype: "audio/ogg; codecs=opus",
+    ptt: false, // false = music message; true = voice-note style
+    fileName: `${safeTitle}.ogg`,
   });
+}
 
-  // 2. Download + convert (cached by query so repeats are instant)
-  const safeKey = query.toLowerCase().replace(/[^a-z0-9]+/g, "_").slice(0, 60);
-  const ext = wantVideo ? "mp4" : "ogg";
-  const outFile = path.join(CACHE_DIR, `${safeKey}.${ext}`);
+/**
+ * Video mode: the same search → rank → try-each-candidate method,
+ * applied to MP4 downloads. Success = the file exists; .part files are
+ * cleared between attempts; one-shot ytsearch fallback when the flat
+ * search comes back empty.
+ */
+async function playVideo(sock, from, query, say) {
+  const safeKey =
+    sanitize(query.toLowerCase()).replace(/\s+/g, "_").slice(0, 60) || "video";
+  const outFile = path.join(VIDEO_DIR, `${safeKey}.mp4`);
 
-  try {
-    if (!fs.existsSync(outFile)) {
-      if (wantVideo) {
-        await downloadVideo(video.url, outFile);
-      } else {
-        await downloadAudio(video.url, outFile);
+  if (fs.existsSync(outFile)) {
+    await say(`♻️ Cached: *${query}*`);
+  } else {
+    // player.py rule: while the IP cooldown is active, fail fast.
+    if (cooldownRemainingMs() > 0) {
+      return say(failureMessage(query));
+    }
+    // Steps 1-2: search cheap, once, and rank (songfetch step 1-2).
+    let candidates = [];
+    try {
+      candidates = await search(query, { limit: 5 });
+    } catch (err) {
+      if (/binary not found/i.test(String((err && err.message) || err))) {
+        return say("⚠️ yt-dlp binary not found — run `npm install` to download it.");
+      }
+      candidates = []; // search failed → fall through to the one-shot fallback
+    }
+    const ranked = rank(candidates, query);
+
+    if (ranked.length > 0) {
+      await say(`🎬 Found: *${ranked[0].title}* — trying in order...`);
+    } else if (cooldownRemainingMs() > 0) {
+      // The search itself hit the bot check / 429 — don't fallback-hammer.
+      return say(failureMessage(query));
+    }
+
+    // Step 3: try each candidate until the file exists.
+    const targets =
+      ranked.length > 0
+        ? ranked.map((c) => ({ url: c.url, title: c.title, skipUnavailable: false }))
+        : [{ url: `ytsearch5:${query}`, title: query, skipUnavailable: true }];
+
+    for (let i = 0; i < targets.length; i++) {
+      const target = targets[i];
+      if (i > 0) await say(`🔁 Trying ${i + 1}/${targets.length}: *${target.title}*...`);
+      // Delete leftover .part files before each retry, otherwise the next
+      // attempt resumes the previous one's half-file.
+      clearPartials(VIDEO_DIR, safeKey);
+      try {
+        await downloadVideo(target.url, outFile, target.skipUnavailable);
+        break;
+      } catch (err) {
+        console.error(`video attempt ${i + 1} failed:`, (err && err.message) || err);
+        noteFailure(err);
+        if (fs.existsSync(outFile)) {
+          try {
+            fs.unlinkSync(outFile);
+          } catch {
+            // ignore
+          }
+        }
+        // A bot check / 429 means the current IP is flagged: stop the
+        // loop (the cooldown will fail fast the next .play) — unless a
+        // rotating proxy pool is active, where the next candidate uses a
+        // different IP and is worth trying.
+        const kind = classifyError(err);
+        if ((kind === "botcheck" || kind === "ratelimit") && !rotatingProxiesActive()) break;
       }
     }
-  } catch (err) {
-    console.error("download error:", err);
-    return sock.sendMessage(from, {
-      text:
-        `⚠️ Download failed for "${video.title}".\n` +
-        `_Error: ${String(err.message || err).slice(0, 200)}_`,
-      edit: status.key,
-    });
+
+    if (!fs.existsSync(outFile)) {
+      return say(failureMessage(query));
+    }
   }
 
-  // 3. Send to WhatsApp in the correct format
+  await say("✅ Sending...");
   await sock.sendMessage(from, {
-    text: `✅ Sending as ${wantVideo ? "video" : "audio"}...`,
-    edit: status.key,
-  });
-
-  const buffer = fs.readFileSync(outFile);
-
-  if (wantVideo) {
-    await sock.sendMessage(from, {
-      video: buffer,
-      mimetype: "video/mp4",
-      caption: `🎬 ${video.title}`,
-    });
-  } else {
-    // WhatsApp plays audio inline ONLY when it's Opus in an OGG container,
-    // mono, ~48kHz. fluent-ffmpeg above produced exactly that.
-    await sock.sendMessage(from, {
-      audio: buffer,
-      mimetype: "audio/ogg; codecs=opus",
-      ptt: false, // false = audio message; true = voice-note style
-      fileName: `${video.title}.ogg`,
-    });
-  }
-}
-
-/**
- * Download + convert a YouTube URL to Opus/OGG (WhatsApp audio format).
- * Uses the standalone yt-dlp binary in bin/ (fetched by the root
- * postinstall script) — no Python, no system yt-dlp needed.
- */
-function downloadAudio(url, outFile) {
-  // Step A: yt-dlp pulls the raw bestaudio stream to a temp opus file.
-  const tmpRaw = outFile.replace(/\.ogg$/, ".raw.opus");
-  return ytdlp(url, {
-    extractAudio: true,
-    audioFormat: "opus",
-    audioQuality: 5,
-    noPlaylist: true,
-    noWarnings: true,
-    quiet: true,
-    output: tmpRaw,
-    // Point yt-dlp at the bundled ffmpeg so it doesn't need a system one.
-    ffmpegLocation: ffmpegPath,
-  })
-    .then(() => {
-      // Step B: re-mux/transcode to mono 48kHz Opus in an OGG container,
-      // which is exactly what WhatsApp needs for inline playback.
-      return new Promise((resolve, reject) => {
-        ffmpeg(tmpRaw)
-          .audioCodec("libopus")
-          .audioChannels(1)
-          .audioFrequency(48000)
-          .audioBitrate("64k")
-          .format("ogg")
-          .on("error", reject)
-          .on("end", resolve)
-          .save(outFile);
-      });
-    })
-    .finally(() => {
-      if (fs.existsSync(tmpRaw)) fs.unlinkSync(tmpRaw);
-    });
-}
-
-/**
- * Download a YouTube URL as an MP4 video (H.264 + AAC), 480p max for speed.
- * Uses the standalone yt-dlp binary in bin/ (fetched by the root postinstall).
- */
-function downloadVideo(url, outFile) {
-  return ytdlp(url, {
-    // The bot-check client ladder may only offer pre-merged mp4 above
-    // 480p, so fall back to DASH (video+audio merged by ffmpeg-static)
-    // before giving up on the height cap.
-    format:
-      "best[height<=480][ext=mp4]/bv[height<=480]+ba/b[height<=480]/best",
-    mergeOutputFormat: "mp4",
-    noPlaylist: true,
-    noWarnings: true,
-    quiet: true,
-    output: outFile,
-    ffmpegLocation: ffmpegPath,
+    video: fs.readFileSync(outFile),
+    mimetype: "video/mp4",
+    caption: `🎬 ${query}`,
   });
 }
 
-module.exports = { play };
+module.exports = { play, downloadVideo, mp3ToWhatsAppOgg };
