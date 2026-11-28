@@ -29,6 +29,7 @@ const {
   setGroupDesc,
 } = require("../commands/group/moderation");
 const { play } = require("../commands/music");
+const { resetAuth, scheduleExit } = require("../commands/resetAuth");
 const { cmdCloud } = require("../commands/cloud");
 const {
   downloadTikTok,
@@ -124,6 +125,14 @@ async function handleMessage(sock, msg) {
 
     case "about": {
       await sock.sendMessage(from, { text: aboutText() }, { quoted: msg });
+      break;
+    }
+
+    case "resetauth": {
+      // Owner-only: wipe the WhatsApp session and restart into pairing.
+      const resetReply = await resetAuth(msg);
+      await sock.sendMessage(from, { text: resetReply }, { quoted: msg });
+      if (isOwnerMessage(msg)) scheduleExit(); // non-owner: nothing was wiped, keep running
       break;
     }
 

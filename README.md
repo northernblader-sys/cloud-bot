@@ -36,6 +36,7 @@ pm2 save
 | `.sticker` | Reply to an image with this to turn it into a sticker |
 | `.tenor <query>[, count]` | Search Tenor and send back animated stickers |
 | `.about` | About Astral Cloud |
+| `.resetauth` | *(owner)* Wipe the WhatsApp session and restart into pairing — the fix when the bot keeps disconnecting. Watch the host logs for the fresh pairing code. |
 
 ## The `.cloud` brain
 
