@@ -51,4 +51,4 @@ async function loadAuth(botNumber) {
   return auth;
 }
 
-module.exports = { loadAuth };
+module.exports = { loadAuth, wipeAuth };
