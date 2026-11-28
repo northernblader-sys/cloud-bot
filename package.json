@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node index.js",
     "test": "node --test test/*.test.js",
+    "wipe-auth": "node scripts/wipeAuth.js",
     "postinstall": "node scripts/install-ytdlp.js"
   },
   "keywords": [],

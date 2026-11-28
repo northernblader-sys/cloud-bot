@@ -15,6 +15,25 @@ On first run, a QR code will print in your terminal. Scan it from
 Once paired, your session is saved to `auth_info/` — you won't need to
 re-scan on future restarts (as long as that folder persists).
 
+### Wiping the session from MongoDB (when the bot is offline)
+
+If the bot keeps disconnecting and you use `MONGODB_URI`, the session
+lives in the `<BOT_ID>_auth` collection — not in a folder you can
+delete. Wipe it from any machine with Node (no bot needed):
+
+```bash
+node scripts/wipeAuth.js --uri="mongodb+srv://user:pass@cluster/..."
+# or, once node_modules is installed:
+npm run wipe-auth -- --uri="mongodb+srv://user:pass@cluster/..."
+```
+
+It asks for confirmation, deletes the session documents, and prints the
+restart steps. Match the bot's env if you customized them: `--db=...`
+(default `astral_cloud`) and `--bot-id=...` (default `astral`). Add
+`--yes` to skip the prompt in scripts/pipes. When `MONGODB_URI` is *not*
+set, the session is the plain `auth_info/` folder — `.resetauth` in chat
+or `rm -rf auth_info` on the host handles that case.
+
 ## Running with PM2 (recommended for VPS)
 
 ```bash
